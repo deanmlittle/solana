@@ -687,6 +687,10 @@ pub mod enable_poseidon_syscall {
     solana_sdk::declare_id!("FL9RsQA6TVUoh5xJQ9d936RHSebA1NLQqe3Zv9sXZRpr");
 }
 
+pub mod secp256r1_program_enabled {
+    solana_sdk::declare_id!("GkVUbiefEqFzzLcArWgNG7r3BCs551UUjdH2hVE5ns3E");
+}
+
 lazy_static! {
     /// Map of feature identifiers to user-visible description
     pub static ref FEATURE_NAMES: HashMap<Pubkey, &'static str> = [
@@ -851,6 +855,7 @@ lazy_static! {
         (reduce_stake_warmup_cooldown::id(), "reduce stake warmup cooldown from 25% to 9%"),
         (revise_turbine_epoch_stakes::id(), "revise turbine epoch stakes"),
         (enable_poseidon_syscall::id(), "Enable Poseidon syscall"),
+        (secp256r1_program_enabled::id(), "Enable secp256r1 signature verification program"),
         /*************** ADD NEW FEATURES HERE ***************/
     ]
     .iter()
