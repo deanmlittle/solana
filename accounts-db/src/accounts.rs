@@ -53,8 +53,9 @@ use {
         },
         pubkey::Pubkey,
         saturating_add_assign,
+        signature::Signature,
         slot_hashes::SlotHashes,
-        sysvar::{self, instructions::construct_instructions_data},
+        sysvar::{self, instructions::construct_instructions_data, signatures::construct_signatures_data},
         transaction::{Result, SanitizedTransaction, TransactionAccountLocks, TransactionError},
         transaction_context::{IndexOfAccount, TransactionAccount},
     },
@@ -235,6 +236,16 @@ impl Accounts {
         })
     }
 
+    fn construct_signatures_account(signatures: &[Signature]) -> AccountSharedData {
+        // Convert signatures to bytes here first to avoid dependency of Solana SDK in sysvar program
+        let signature_array: Vec<[u8;64]> = signatures.iter().map(|s| <[u8;64]>::from(*s)).collect();
+        AccountSharedData::from(Account {
+            data: construct_signatures_data(&signature_array),
+            owner: sysvar::id(),
+            ..Account::default()
+        })
+    }
+
     /// If feature `cap_transaction_accounts_data_size` is active, total accounts data a
     /// transaction can load is limited to
     ///   if `set_tx_loaded_accounts_data_size` instruction is not activated or not used, then
@@ -358,6 +369,8 @@ impl Accounts {
                 #[allow(clippy::collapsible_else_if)]
                 let account = if solana_sdk::sysvar::instructions::check_id(key) {
                     Self::construct_instructions_account(message)
+                } else if solana_sdk::sysvar::signatures::check_id(key) {
+                    Self::construct_signatures_account(tx.signatures())
                 } else {
                     let instruction_account = u8::try_from(i)
                         .map(|i| instruction_accounts.contains(&&i))
