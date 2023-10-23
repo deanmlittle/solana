@@ -169,6 +169,24 @@ pub fn verify(
     Ok(())
 }
 
+fn get_instruction_data<'a>(
+    data: &'a [u8],
+    instruction_datas: &'a [&[u8]],
+    instruction_index: u16
+) -> Result<&'a [u8], PrecompileError> {
+    match instruction_index {
+        u16::MAX => {
+            Ok(data)
+        },
+        _ => {
+            let signature_index = instruction_index as usize;
+            if signature_index >= instruction_datas.len() {
+                return Err(PrecompileError::InvalidDataOffsets);
+            }
+            Ok(instruction_datas[signature_index])
+        }
+}
+
 fn get_data_slice<'a>(
     data: &'a [u8],
     instruction_datas: &'a [&[u8]],
@@ -176,16 +194,7 @@ fn get_data_slice<'a>(
     offset_start: u16,
     size: usize,
 ) -> Result<&'a [u8], PrecompileError> {
-    let instruction = if instruction_index == u16::MAX {
-        data
-    } else {
-        let signature_index = instruction_index as usize;
-        if signature_index >= instruction_datas.len() {
-            return Err(PrecompileError::InvalidDataOffsets);
-        }
-        instruction_datas[signature_index]
-    };
-
+    let instruction = get_instruction_data(data, instruction_datas, instruction_index)?;
     let start = offset_start as usize;
     let end = start.saturating_add(size);
     if end > instruction.len() {
@@ -201,15 +210,7 @@ fn get_sec1_pubkey_slice<'a>(
     instruction_index: u16,
     offset_start: u16,
 ) -> Result<&'a [u8], PrecompileError> {
-    let instruction = if instruction_index == u16::MAX {
-        data
-    } else {
-        let signature_index = instruction_index as usize;
-        if signature_index >= instruction_datas.len() {
-            return Err(PrecompileError::InvalidDataOffsets);
-        }
-        instruction_datas[signature_index]
-    };
+    let instruction = get_instruction_data(data, instruction_datas, instruction_index)?;
 
     let size = match instruction.get(offset_start as usize).ok_or(PrecompileError::InvalidPublicKey)? {
         0x02 | 0x03 => COMPRESSED_PUBKEY_SERIALIZED_SIZE,
