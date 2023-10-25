@@ -66,7 +66,7 @@ num-derive = { workspace = true }
 num-traits = { workspace = true }
 num_enum = { workspace = true }
 pbkdf2 = { workspace = true }
-p256 = { workspace = true, features = ["arithmetic"], optional = true }
+p256 = { workspace = true, optional = true }
 qstring = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true, optional = true }

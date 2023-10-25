@@ -1,9 +1,9 @@
 //! Instructions for the [secp256r1 native program][np].
 //!
-//TODO 
 //! [np]: https://docs.solana.com/developing/runtime-facilities/programs#secp256r1-program
 
 #![cfg(feature = "full")]
+
 use {
     crate::{feature_set::FeatureSet, instruction::Instruction, precompiles::PrecompileError},
     bytemuck::{bytes_of, Pod, Zeroable},
@@ -14,7 +14,6 @@ use {
 };
 
 pub const COMPRESSED_PUBKEY_SERIALIZED_SIZE: usize = 33;
-pub const PUBKEY_SERIALIZED_SIZE: usize = 65;
 pub const SIGNATURE_SERIALIZED_SIZE: usize = 64;
 pub const SIGNATURE_OFFSETS_SERIALIZED_SIZE: usize = 14;
 // bytemuck requires structures to be aligned
@@ -24,9 +23,9 @@ pub const DATA_START: usize = SIGNATURE_OFFSETS_SERIALIZED_SIZE + SIGNATURE_OFFS
 #[derive(Default, Debug, Copy, Clone, Zeroable, Pod, Eq, PartialEq)]
 #[repr(C)]
 pub struct Secp256r1SignatureOffsets {
-    signature_offset: u16,             // offset to secp256r1 signature of 64 bytes
+    signature_offset: u16,             // offset to compact secp256r1 signature of 64 bytes
     signature_instruction_index: u16,  // instruction index to find signature
-    public_key_offset: u16,            // offset to public key of 33 or 65 bytes
+    public_key_offset: u16,            // offset to compressed public key of 33 bytes
     public_key_instruction_index: u16, // instruction index to find public key
     message_data_offset: u16,          // offset to start of message data
     message_data_size: u16,            // size of message data
@@ -34,7 +33,7 @@ pub struct Secp256r1SignatureOffsets {
 }
 
 pub fn new_secp256r1_instruction(signer: &SigningKey, message: &[u8]) -> Instruction {
-    let signature = signer.sign(message);
+    let signature = signer.sign(&message);
     let signature = signature.normalize_s().unwrap_or(signature).to_vec();
     let pubkey = VerifyingKey::from(signer).to_encoded_point(true).to_bytes();
 
@@ -125,33 +124,14 @@ pub fn verify(
             SIGNATURE_SERIALIZED_SIZE,
         )?;
 
-        let signature =
-            Signature::try_from(signature).map_err(|_| PrecompileError::InvalidSignature)?;
-
-        // TODO: Do we enforce low S?
-        // if signature.s().is_high().into() {
-        //     return Err(PrecompileError::InvalidSignature);
-        // }
-
-        // TODO: Do we disallow uncompressed pubkeys?
-        // let pubkey = get_data_slice(
-        //     data,
-        //     instruction_datas,
-        //     offsets.public_key_instruction_index,
-        //     offsets.public_key_offset,
-        //     COMPRESSED_PUBKEY_SERIALIZED_SIZE
-        // )?;
-        
-        // Parse out SEC1 encoded pubkey
-        let pubkey = get_sec1_pubkey_slice(
+        // Parse out pubkey
+        let pubkey = get_data_slice(
             data,
             instruction_datas,
             offsets.public_key_instruction_index,
-            offsets.public_key_offset
+            offsets.public_key_offset,
+            COMPRESSED_PUBKEY_SERIALIZED_SIZE
         )?;
-
-        let publickey = p256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey)
-            .map_err(|_| PrecompileError::InvalidPublicKey)?;
 
         // Parse out message
         let message = get_data_slice(
@@ -162,29 +142,21 @@ pub fn verify(
             offsets.message_data_size as usize,
         )?;
 
-        publickey
-            .verify(message, &signature)
+        let signature =
+        Signature::try_from(signature).map_err(|_| PrecompileError::InvalidSignature)?;
+
+        // Enforce Low-S
+        if signature.s().is_high().into() {
+            return Err(PrecompileError::InvalidSignature);
+        }
+
+        let publickey = p256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey)
+            .map_err(|_| PrecompileError::InvalidPublicKey)?;
+
+        publickey.verify(&message, &signature)
             .map_err(|_| PrecompileError::InvalidSignature)?;
     }
     Ok(())
-}
-
-fn get_instruction_data<'a>(
-    data: &'a [u8],
-    instruction_datas: &'a [&[u8]],
-    instruction_index: u16
-) -> Result<&'a [u8], PrecompileError> {
-    match instruction_index {
-        u16::MAX => {
-            Ok(data)
-        },
-        _ => {
-            let signature_index = instruction_index as usize;
-            if signature_index >= instruction_datas.len() {
-                return Err(PrecompileError::InvalidDataOffsets);
-            }
-            Ok(instruction_datas[signature_index])
-        }
 }
 
 fn get_data_slice<'a>(
@@ -194,28 +166,14 @@ fn get_data_slice<'a>(
     offset_start: u16,
     size: usize,
 ) -> Result<&'a [u8], PrecompileError> {
-    let instruction = get_instruction_data(data, instruction_datas, instruction_index)?;
-    let start = offset_start as usize;
-    let end = start.saturating_add(size);
-    if end > instruction.len() {
-        return Err(PrecompileError::InvalidDataOffsets);
-    }
-
-    Ok(&instruction[start..end])
-}
-
-fn get_sec1_pubkey_slice<'a>(
-    data: &'a [u8],
-    instruction_datas: &'a [&[u8]],
-    instruction_index: u16,
-    offset_start: u16,
-) -> Result<&'a [u8], PrecompileError> {
-    let instruction = get_instruction_data(data, instruction_datas, instruction_index)?;
-
-    let size = match instruction.get(offset_start as usize).ok_or(PrecompileError::InvalidPublicKey)? {
-        0x02 | 0x03 => COMPRESSED_PUBKEY_SERIALIZED_SIZE,
-        0x04 => PUBKEY_SERIALIZED_SIZE,
-        _ => return Err(PrecompileError::InvalidPublicKey)
+    let instruction = if instruction_index == u16::MAX {
+        data
+    } else {
+        let signature_index = instruction_index as usize;
+        if signature_index >= instruction_datas.len() {
+            return Err(PrecompileError::InvalidDataOffsets);
+        }
+        instruction_datas[signature_index]
     };
 
     let start = offset_start as usize;
