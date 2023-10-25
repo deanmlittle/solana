@@ -680,6 +680,9 @@ pub mod enable_poseidon_syscall {
     solana_sdk::declare_id!("FL9RsQA6TVUoh5xJQ9d936RHSebA1NLQqe3Zv9sXZRpr");
 }
 
+pub mod secp256r1_program_enabled {
+    solana_sdk::declare_id!("GkVUbiefEqFzzLcArWgNG7r3BCs551UUjdH2hVE5ns3E");
+
 pub mod timely_vote_credits {
     solana_sdk::declare_id!("2oXpeh141pPZCTCFHBsvCwG2BtaHZZAtrVhwaxSy6brS");
 }
@@ -888,6 +891,7 @@ lazy_static! {
         (reduce_stake_warmup_cooldown::id(), "reduce stake warmup cooldown from 25% to 9%"),
         (revise_turbine_epoch_stakes::id(), "revise turbine epoch stakes"),
         (enable_poseidon_syscall::id(), "Enable Poseidon syscall"),
+        (secp256r1_program_enabled::id(), "Enable secp256r1 signature verification program"),
         (timely_vote_credits::id(), "use timeliness of votes in determining credits to award"),
         (remaining_compute_units_syscall_enabled::id(), "enable the remaining_compute_units syscall"),
         (enable_program_runtime_v2_and_loader_v4::id(), "Enable Program-Runtime-v2 and Loader-v4 #33293"),

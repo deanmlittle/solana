@@ -52,7 +52,7 @@ pub use solana_program::{
     incinerator, instruction, keccak, lamports, loader_instruction, loader_upgradeable_instruction,
     loader_v4, loader_v4_instruction, message, msg, native_token, nonce, poseidon, program,
     program_error, program_memory, program_option, program_pack, rent, sanitize, sdk_ids,
-    secp256k1_program, secp256k1_recover, serde_varint, serialize_utils, short_vec, slot_hashes,
+    secp256k1_program, secp256k1_recover,secp256r1_program, serde_varint, serialize_utils, short_vec, slot_hashes,
     slot_history, stable_layout, stake, stake_history, syscalls, system_instruction,
     system_program, sysvar, unchecked_div_by_const, vote, wasm_bindgen,
 };
@@ -92,6 +92,7 @@ pub mod recent_blockhashes_account;
 pub mod reward_type;
 pub mod rpc_port;
 pub mod secp256k1_instruction;
+pub mod secp256r1_instruction;
 pub mod shred_version;
 pub mod signature;
 pub mod signer;

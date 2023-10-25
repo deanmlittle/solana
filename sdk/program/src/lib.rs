@@ -520,6 +520,7 @@ pub mod rent;
 pub mod sanitize;
 pub mod secp256k1_program;
 pub mod secp256k1_recover;
+pub mod secp256r1_program;
 pub mod serde_varint;
 pub mod serialize_utils;
 pub mod short_vec;

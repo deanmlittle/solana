@@ -158,6 +158,52 @@ process_instruction() {
 }
 ```
 
+## Secp256r1 Program
+
+Verify Secp256r1 signature program. This program takes an Secp256r1 signature, SEC1 encoded public key, and message.
+Multiple signatures can be verified. If any of the signatures fail to verify, an error is returned.
+
+- Program id: `Secp256r1SigVerify1111111111111111111111111`
+- Instructions: [new_secp256r1_instruction](https://github.com/solana-labs/solana/blob/master/sdk/src/secp256r1_instruction.rs#L36)
+
+The secp256r1 program processes an instruction. The first `u8` is a count of the number of
+signatures to check, which is followed by a single byte padding. After that, the
+following struct is serialized, one for each signature to check.
+
+```
+struct Secp256r1SignatureOffsets {
+    signature_offset: u16,             // offset to secp256r1 signature of 64 bytes
+    signature_instruction_index: u16,  // instruction index to find signature
+    public_key_offset: u16,            // offset to SEC1-encoded public key of 33 or 65 bytes
+    public_key_instruction_index: u16, // instruction index to find public key
+    message_data_offset: u16,          // offset to start of message data
+    message_data_size: u16,            // size of message data
+    message_instruction_index: u16,    // index of instruction data to get message data
+}
+```
+
+Pseudo code of the operation:
+
+```
+process_instruction() {
+    for i in 0..count {
+        // i'th index values referenced:
+        instructions = &transaction.message().instructions
+        instruction_index = secp256r1_signature_instruction_index != u16::MAX ? secp256r1_signature_instruction_index : current_instruction;
+        signature = instructions[instruction_index].data[secp256r1_signature_offset..secp256r1_signature_offset + 64]
+        instruction_index = secp256r1_pubkey_instruction_index != u16::MAX ? secp256r1_pubkey_instruction_index : current_instruction;
+        pubkey_length = instructions[instruction_index].data[secp256r1_pubkey_offset] != 1 ? 33 : 65;
+        pubkey = instructions[instruction_index].data[secp256r1_pubkey_offset..secp256r1_pubkey_offset + pubkey_length]
+        instruction_index = secp256r1_message_instruction_index != u16::MAX ? secp256r1_message_instruction_index : current_instruction;
+        message = instructions[instruction_index].data[secp256r1_message_data_offset..secp256r1_message_data_offset + secp256r1_message_data_size]
+        if pubkey.verify(signature, message) != Success {
+            return Error
+        }
+    }
+    return Success
+}
+```
+
 This allows the user to specify any instruction data in the transaction for
 signature and message data. By specifying a special instructions sysvar, one can
 also receive data from the transaction itself.

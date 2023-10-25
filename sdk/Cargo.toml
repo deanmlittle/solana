@@ -22,6 +22,7 @@ default = [
 full = [
     "assert_matches",
     "byteorder",
+    "elliptic-curve",
     "chrono",
     "generic-array",
     "memmap2",
@@ -32,6 +33,7 @@ full = [
     "ed25519-dalek-bip32",
     "solana-logger",
     "libsecp256k1",
+    "p256",
     "sha3",
     "digest",
 ]
@@ -52,6 +54,7 @@ derivation-path = { workspace = true }
 digest = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 ed25519-dalek-bip32 = { workspace = true, optional = true }
+elliptic-curve = { workspace = true, optional = true }
 generic-array = { workspace = true, features = ["serde", "more_lengths"], optional = true }
 hmac = { workspace = true }
 itertools =  { workspace = true }
@@ -63,6 +66,7 @@ num-derive = { workspace = true }
 num-traits = { workspace = true }
 num_enum = { workspace = true }
 pbkdf2 = { workspace = true }
+p256 = { workspace = true, optional = true }
 qstring = { workspace = true }
 qualifier_attr = { workspace = true }
 rand = { workspace = true, optional = true }
