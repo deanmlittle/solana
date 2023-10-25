@@ -1,5 +1,4 @@
 use {
-    rand::Rng,
     solana_measure::measure::Measure,
     solana_program_runtime::{
         compute_budget::ComputeBudget,
@@ -13,17 +12,15 @@ use {
     },
     solana_rbpf::{
         aligned_memory::AlignedMemory,
-        ebpf,
+        declare_builtin_function, ebpf,
         elf::Executable,
+        error::ProgramResult,
         memory_region::{MemoryMapping, MemoryRegion},
-        verifier::RequisiteVerifier,
-        vm::{
-            BuiltinProgram, Config, ContextObject, EbpfVm, ProgramResult,
-            PROGRAM_ENVIRONMENT_KEY_SHIFT,
-        },
+        program::{BuiltinProgram, FunctionRegistry},
+        vm::{Config, ContextObject, EbpfVm},
     },
     solana_sdk::{
-        entrypoint::{HEAP_LENGTH, SUCCESS},
+        entrypoint::SUCCESS,
         feature_set,
         instruction::InstructionError,
         loader_v4::{self, LoaderV4State, LoaderV4Status, DEPLOYMENT_COOLDOWN_IN_SLOTS},
@@ -86,10 +83,6 @@ pub fn create_program_runtime_environment_v2<'a>(
         reject_broken_elfs: true,
         noop_instruction_rate: 256,
         sanitize_user_provided_values: true,
-        runtime_environment_key: rand::thread_rng()
-            .gen::<i32>()
-            .checked_shr(PROGRAM_ENVIRONMENT_KEY_SHIFT)
-            .unwrap_or(0),
         external_internal_function_hash_collision: true,
         reject_callx_r10: true,
         enable_sbpf_v1: false,
@@ -99,13 +92,13 @@ pub fn create_program_runtime_environment_v2<'a>(
         aligned_memory_mapping: true,
         // Warning, do not use `Config::default()` so that configuration here is explicit.
     };
-    BuiltinProgram::new_loader(config)
+    BuiltinProgram::new_loader(config, FunctionRegistry::default())
 }
 
-fn calculate_heap_cost(heap_size: u64, heap_cost: u64) -> u64 {
+fn calculate_heap_cost(heap_size: u32, heap_cost: u64) -> u64 {
     const KIBIBYTE: u64 = 1024;
     const PAGE_SIZE_KB: u64 = 32;
-    heap_size
+    u64::from(heap_size)
         .saturating_add(PAGE_SIZE_KB.saturating_mul(KIBIBYTE).saturating_sub(1))
         .checked_div(PAGE_SIZE_KB.saturating_mul(KIBIBYTE))
         .expect("PAGE_SIZE_KB * KIBIBYTE > 0")
@@ -116,19 +109,16 @@ fn calculate_heap_cost(heap_size: u64, heap_cost: u64) -> u64 {
 /// Create the SBF virtual machine
 pub fn create_vm<'a, 'b>(
     invoke_context: &'a mut InvokeContext<'b>,
-    program: &'a Executable<RequisiteVerifier, InvokeContext<'b>>,
+    program: &'a Executable<InvokeContext<'b>>,
 ) -> Result<EbpfVm<'a, InvokeContext<'b>>, Box<dyn std::error::Error>> {
     let config = program.get_config();
     let sbpf_version = program.get_sbpf_version();
     let compute_budget = invoke_context.get_compute_budget();
-    let heap_size = compute_budget.heap_size.unwrap_or(HEAP_LENGTH);
-    invoke_context.consume_checked(calculate_heap_cost(
-        heap_size as u64,
-        compute_budget.heap_cost,
-    ))?;
+    let heap_size = compute_budget.heap_size;
+    invoke_context.consume_checked(calculate_heap_cost(heap_size, compute_budget.heap_cost))?;
     let mut stack = AlignedMemory::<{ ebpf::HOST_ALIGN }>::zero_filled(config.stack_size());
     let mut heap = AlignedMemory::<{ ebpf::HOST_ALIGN }>::zero_filled(
-        compute_budget.heap_size.unwrap_or(HEAP_LENGTH),
+        usize::try_from(compute_budget.heap_size).unwrap(),
     );
     let stack_len = stack.len();
     let regions: Vec<MemoryRegion> = vec![
@@ -142,7 +132,7 @@ pub fn create_vm<'a, 'b>(
         Box::new(InstructionError::ProgramEnvironmentSetupFailure)
     })?;
     Ok(EbpfVm::new(
-        config,
+        program.get_loader().clone(),
         sbpf_version,
         invoke_context,
         memory_mapping,
@@ -152,13 +142,12 @@ pub fn create_vm<'a, 'b>(
 
 fn execute<'a, 'b: 'a>(
     invoke_context: &'a mut InvokeContext<'b>,
-    executable: &'a Executable<RequisiteVerifier, InvokeContext<'static>>,
+    executable: &'a Executable<InvokeContext<'static>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // We dropped the lifetime tracking in the Executor by setting it to 'static,
     // thus we need to reintroduce the correct lifetime of InvokeContext here again.
-    let executable = unsafe {
-        std::mem::transmute::<_, &'a Executable<RequisiteVerifier, InvokeContext<'b>>>(executable)
-    };
+    let executable =
+        unsafe { std::mem::transmute::<_, &'a Executable<InvokeContext<'b>>>(executable) };
     let log_collector = invoke_context.get_log_collector();
     let stack_height = invoke_context.get_stack_height();
     let transaction_context = &invoke_context.transaction_context;
@@ -194,9 +183,9 @@ fn execute<'a, 'b: 'a>(
     match result {
         ProgramResult::Ok(status) if status != SUCCESS => {
             let error: InstructionError = status.into();
-            Err(Box::new(error) as Box<dyn std::error::Error>)
+            Err(error.into())
         }
-        ProgramResult::Err(error) => Err(error),
+        ProgramResult::Err(error) => Err(error.into()),
         _ => Ok(()),
     }
 }
@@ -350,7 +339,7 @@ pub fn process_instruction_truncate(
         )?;
         if is_initialization {
             let state = get_state_mut(program.get_data_mut()?)?;
-            state.slot = invoke_context.get_sysvar_cache().get_clock()?.slot;
+            state.slot = 0;
             state.status = LoaderV4Status::Retracted;
             state.authority_address = *authority_address;
         }
@@ -378,7 +367,11 @@ pub fn process_instruction_deploy(
         authority_address,
     )?;
     let current_slot = invoke_context.get_sysvar_cache().get_clock()?.slot;
-    if state.slot.saturating_add(DEPLOYMENT_COOLDOWN_IN_SLOTS) > current_slot {
+
+    // Slot = 0 indicates that the program hasn't been deployed yet. So no need to check for the cooldown slots.
+    // (Without this check, the program deployment is failing in freshly started test validators. That's
+    //  because at startup current_slot is 0, which is < DEPLOYMENT_COOLDOWN_IN_SLOTS).
+    if state.slot != 0 && state.slot.saturating_add(DEPLOYMENT_COOLDOWN_IN_SLOTS) > current_slot {
         ic_logger_msg!(
             log_collector,
             "Program was deployed recently, cooldown still in effect"
@@ -438,8 +431,8 @@ pub fn process_instruction_deploy(
     load_program_metrics.submit_datapoint(&mut invoke_context.timings);
     if let Some(mut source_program) = source_program {
         let rent = invoke_context.get_sysvar_cache().get_rent()?;
-        let required_lamports = rent.minimum_balance(program.get_data().len());
-        let transfer_lamports = program.get_lamports().saturating_sub(required_lamports);
+        let required_lamports = rent.minimum_balance(source_program.get_data().len());
+        let transfer_lamports = required_lamports.saturating_sub(program.get_lamports());
         program.set_data_from_slice(source_program.get_data())?;
         source_program.set_data_length(0)?;
         source_program.checked_sub_lamports(transfer_lamports)?;
@@ -535,18 +528,20 @@ pub fn process_instruction_transfer_authority(
     Ok(())
 }
 
-pub fn process_instruction(
-    invoke_context: &mut InvokeContext,
-    _arg0: u64,
-    _arg1: u64,
-    _arg2: u64,
-    _arg3: u64,
-    _arg4: u64,
-    _memory_mapping: &mut MemoryMapping,
-    result: &mut ProgramResult,
-) {
-    *result = process_instruction_inner(invoke_context).into();
-}
+declare_builtin_function!(
+    Entrypoint,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _arg0: u64,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        process_instruction_inner(invoke_context)
+    }
+);
 
 pub fn process_instruction_inner(
     invoke_context: &mut InvokeContext,
@@ -595,11 +590,10 @@ pub fn process_instruction_inner(
         let mut get_or_create_executor_time = Measure::start("get_or_create_executor_time");
         let loaded_program = invoke_context
             .find_program_in_cache(program.get_key())
-            .ok_or(InstructionError::InvalidAccountData)?;
-
-        if loaded_program.is_tombstone() {
-            return Err(Box::new(InstructionError::InvalidAccountData));
-        }
+            .ok_or_else(|| {
+                ic_logger_msg!(log_collector, "Program is not cached");
+                InstructionError::InvalidAccountData
+            })?;
         get_or_create_executor_time.stop();
         saturating_add_assign!(
             invoke_context.timings.get_or_create_executor_us,
@@ -613,6 +607,7 @@ pub fn process_instruction_inner(
             LoadedProgramType::FailedVerification(_)
             | LoadedProgramType::Closed
             | LoadedProgramType::DelayVisibility => {
+                ic_logger_msg!(log_collector, "Program is not deployed");
                 Err(Box::new(InstructionError::InvalidAccountData) as Box<dyn std::error::Error>)
             }
             LoadedProgramType::Typed(executable) => execute(invoke_context, executable),
@@ -708,7 +703,7 @@ mod tests {
             transaction_accounts,
             instruction_accounts,
             expected_result,
-            super::process_instruction,
+            Entrypoint::vm,
             |invoke_context| {
                 invoke_context
                     .programs_modified_by_tx
@@ -763,7 +758,11 @@ mod tests {
         let transaction_accounts = vec![
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Deployed, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Deployed,
+                    "relative_call",
+                ),
             ),
             (
                 authority_address,
@@ -771,7 +770,11 @@ mod tests {
             ),
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Finalized, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Finalized,
+                    "relative_call",
+                ),
             ),
             (
                 clock::id(),
@@ -853,7 +856,11 @@ mod tests {
         let transaction_accounts = vec![
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Retracted, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Retracted,
+                    "relative_call",
+                ),
             ),
             (
                 authority_address,
@@ -861,7 +868,11 @@ mod tests {
             ),
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Deployed, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Deployed,
+                    "relative_call",
+                ),
             ),
             (
                 clock::id(),
@@ -942,7 +953,11 @@ mod tests {
         let mut transaction_accounts = vec![
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Retracted, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Retracted,
+                    "relative_call",
+                ),
             ),
             (
                 authority_address,
@@ -954,19 +969,23 @@ mod tests {
             ),
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(20000000, 0, &loader_v4::id()),
+                AccountSharedData::new(40000000, 0, &loader_v4::id()),
             ),
             (
                 Pubkey::new_unique(),
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Retracted,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Deployed, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Deployed,
+                    "relative_call",
+                ),
             ),
             (
                 clock::id(),
@@ -1194,7 +1213,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Retracted,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (
@@ -1203,7 +1222,11 @@ mod tests {
             ),
             (
                 Pubkey::new_unique(),
-                load_program_account_from_elf(authority_address, LoaderV4Status::Retracted, "noop"),
+                load_program_account_from_elf(
+                    authority_address,
+                    LoaderV4Status::Retracted,
+                    "relative_call",
+                ),
             ),
             (
                 Pubkey::new_unique(),
@@ -1338,7 +1361,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Deployed,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (
@@ -1354,7 +1377,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Retracted,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (clock::id(), clock(1000)),
@@ -1418,7 +1441,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Deployed,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (
@@ -1426,7 +1449,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Retracted,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (
@@ -1519,7 +1542,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Finalized,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (
@@ -1535,7 +1558,7 @@ mod tests {
                 load_program_account_from_elf(
                     authority_address,
                     LoaderV4Status::Retracted,
-                    "rodata",
+                    "rodata_section",
                 ),
             ),
             (

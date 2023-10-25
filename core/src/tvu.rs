@@ -11,15 +11,14 @@ use {
         },
         cluster_slots_service::{cluster_slots::ClusterSlots, ClusterSlotsService},
         completed_data_sets_service::CompletedDataSetsSender,
-        consensus::tower_storage::TowerStorage,
+        consensus::{tower_storage::TowerStorage, Tower},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
         ledger_cleanup_service::LedgerCleanupService,
-        repair::repair_service::RepairInfo,
+        repair::{quic_endpoint::LocalRequest, repair_service::RepairInfo},
         replay_stage::{ReplayStage, ReplayStageConfig},
         rewards_recorder_service::RewardsRecorderSender,
         shred_fetch_stage::ShredFetchStage,
-        validator::ProcessBlockStore,
         voting_service::VotingService,
         warm_quic_cache_service::WarmQuicCacheService,
         window_service::WindowService,
@@ -44,10 +43,10 @@ use {
     solana_runtime::{
         accounts_background_service::AbsRequestSender, bank_forks::BankForks,
         commitment::BlockCommitmentCache, prioritization_fee_cache::PrioritizationFeeCache,
-        vote_sender_types::ReplayVoteSender,
     },
     solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Keypair},
     solana_turbine::retransmit_stage::RetransmitStage,
+    solana_vote::vote_sender_types::ReplayVoteSender,
     std::{
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
@@ -109,7 +108,7 @@ impl Tvu {
         ledger_signal_receiver: Receiver<bool>,
         rpc_subscriptions: &Arc<RpcSubscriptions>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        maybe_process_block_store: Option<ProcessBlockStore>,
+        tower: Tower,
         tower_storage: Arc<dyn TowerStorage>,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         exit: Arc<AtomicBool>,
@@ -138,6 +137,7 @@ impl Tvu {
         banking_tracer: Arc<BankingTracer>,
         turbine_quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
+        repair_quic_endpoint_sender: AsyncSender<LocalRequest>,
     ) -> Result<Self, String> {
         let TvuSockets {
             repair: repair_socket,
@@ -151,10 +151,13 @@ impl Tvu {
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);
         let fetch_sockets: Vec<Arc<UdpSocket>> = fetch_sockets.into_iter().map(Arc::new).collect();
+        let (repair_quic_endpoint_response_sender, repair_quic_endpoint_response_receiver) =
+            unbounded();
         let fetch_stage = ShredFetchStage::new(
             fetch_sockets,
             turbine_quic_endpoint_receiver,
             repair_socket.clone(),
+            repair_quic_endpoint_response_receiver,
             fetch_sender,
             tvu_config.shred_version,
             bank_forks.clone(),
@@ -209,6 +212,8 @@ impl Tvu {
                 retransmit_sender,
                 repair_socket,
                 ancestor_hashes_socket,
+                repair_quic_endpoint_sender,
+                repair_quic_endpoint_response_sender,
                 exit.clone(),
                 repair_info,
                 leader_schedule_cache.clone(),
@@ -286,7 +291,7 @@ impl Tvu {
             ledger_signal_receiver,
             duplicate_slots_receiver,
             poh_recorder.clone(),
-            maybe_process_block_store,
+            tower,
             vote_tracker,
             cluster_slots,
             retransmit_slots_sender,
@@ -401,6 +406,8 @@ pub mod tests {
         let (turbine_quic_endpoint_sender, _turbine_quic_endpoint_receiver) =
             tokio::sync::mpsc::channel(/*capacity:*/ 128);
         let (_turbine_quic_endpoint_sender, turbine_quic_endpoint_receiver) = unbounded();
+        let (repair_quic_endpoint_sender, _repair_quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*buffer:*/ 128);
         //start cluster_info1
         let cluster_info1 =
             ClusterInfo::new(target1.info.clone(), keypair, SocketAddrSpace::Unspecified);
@@ -455,7 +462,7 @@ pub mod tests {
                 OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
             )),
             &poh_recorder,
-            None,
+            Tower::default(),
             Arc::new(FileTowerStorage::default()),
             &leader_schedule_cache,
             exit.clone(),
@@ -484,6 +491,7 @@ pub mod tests {
             BankingTracer::new_disabled(),
             turbine_quic_endpoint_sender,
             turbine_quic_endpoint_receiver,
+            repair_quic_endpoint_sender,
         )
         .expect("assume success");
         exit.store(true, Ordering::Relaxed);

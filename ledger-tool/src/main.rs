@@ -1024,13 +1024,14 @@ fn get_latest_optimistic_slots(
 /// Finds the accounts needed to replay slots `snapshot_slot` to `ending_slot`.
 /// Removes all other accounts from accounts_db, and updates the accounts hash
 /// and capitalization. This is used by the --minimize option in create-snapshot
+/// Returns true if the minimized snapshot may be incomplete.
 fn minimize_bank_for_snapshot(
     blockstore: &Blockstore,
     bank: &Bank,
     snapshot_slot: Slot,
     ending_slot: Slot,
-) {
-    let (transaction_account_set, transaction_accounts_measure) = measure!(
+) -> bool {
+    let ((transaction_account_set, possibly_incomplete), transaction_accounts_measure) = measure!(
         blockstore.get_accounts_used_in_range(bank, snapshot_slot, ending_slot),
         "get transaction accounts"
     );
@@ -1038,6 +1039,7 @@ fn minimize_bank_for_snapshot(
     info!("Added {total_accounts_len} accounts from transactions. {transaction_accounts_measure}");
 
     SnapshotMinimizer::minimize(bank, snapshot_slot, ending_slot, transaction_account_set);
+    possibly_incomplete
 }
 
 fn assert_capitalization(bank: &Bank) {
@@ -1146,6 +1148,11 @@ fn main() {
         .value_name("PATHS")
         .takes_value(true)
         .help("Comma separated persistent accounts location");
+    let accounts_hash_cache_path_arg = Arg::with_name("accounts_hash_cache_path")
+        .long("accounts-hash-cache-path")
+        .value_name("PATH")
+        .takes_value(true)
+        .help("Use PATH as accounts hash cache location [default: <LEDGER>/accounts_hash_cache]");
     let accounts_index_path_arg = Arg::with_name("accounts_index_path")
         .long("accounts-index-path")
         .value_name("PATH")
@@ -1240,7 +1247,6 @@ fn main() {
     let use_snapshot_archives_at_startup =
         Arg::with_name(use_snapshot_archives_at_startup::cli::NAME)
             .long(use_snapshot_archives_at_startup::cli::LONG_ARG)
-            .hidden(hidden_unless_forced())
             .takes_value(true)
             .possible_values(use_snapshot_archives_at_startup::cli::POSSIBLE_VALUES)
             .default_value(use_snapshot_archives_at_startup::cli::default_value())
@@ -1593,6 +1599,7 @@ fn main() {
             .about("Verify the ledger")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
+            .arg(&accounts_hash_cache_path_arg)
             .arg(&accounts_index_path_arg)
             .arg(&halt_at_slot_arg)
             .arg(&limit_load_slot_count_from_snapshot_arg)
@@ -1676,6 +1683,7 @@ fn main() {
             .about("Create a Graphviz rendering of the ledger")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
+            .arg(&accounts_hash_cache_path_arg)
             .arg(&accounts_index_bins)
             .arg(&accounts_index_limit)
             .arg(&disable_disk_index)
@@ -1711,6 +1719,7 @@ fn main() {
             .about("Create a new ledger snapshot")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
+            .arg(&accounts_hash_cache_path_arg)
             .arg(&accounts_index_bins)
             .arg(&accounts_index_limit)
             .arg(&disable_disk_index)
@@ -1904,6 +1913,7 @@ fn main() {
             .about("Print account stats and contents after processing the ledger")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
+            .arg(&accounts_hash_cache_path_arg)
             .arg(&accounts_index_bins)
             .arg(&accounts_index_limit)
             .arg(&disable_disk_index)
@@ -1937,6 +1947,7 @@ fn main() {
             .about("Print capitalization (aka, total supply) while checksumming it")
             .arg(&no_snapshot_arg)
             .arg(&account_paths_arg)
+            .arg(&accounts_hash_cache_path_arg)
             .arg(&accounts_index_bins)
             .arg(&accounts_index_limit)
             .arg(&disable_disk_index)
@@ -3128,7 +3139,7 @@ fn main() {
 
                         if child_bank_required {
                             while !bank.is_complete() {
-                                bank.register_tick(&Hash::new_unique());
+                                bank.register_unique_tick();
                             }
                         }
 
@@ -3149,14 +3160,16 @@ fn main() {
                             bank
                         };
 
-                        if is_minimized {
+                        let minimize_snapshot_possibly_incomplete = if is_minimized {
                             minimize_bank_for_snapshot(
                                 &blockstore,
                                 &bank,
                                 snapshot_slot,
                                 ending_slot.unwrap(),
-                            );
-                        }
+                            )
+                        } else {
+                            false
+                        };
 
                         println!(
                             "Creating a version {} {}snapshot of slot {}",
@@ -3235,6 +3248,10 @@ fn main() {
                                 if starting_epoch != ending_epoch {
                                     warn!("Minimized snapshot range crosses epoch boundary ({} to {}). Bank hashes after {} will not match replays from a full snapshot",
                                         starting_epoch, ending_epoch, bank.epoch_schedule().get_last_slot_in_epoch(starting_epoch));
+                                }
+
+                                if minimize_snapshot_possibly_incomplete {
+                                    warn!("Minimized snapshot may be incomplete due to missing accounts from CPI'd address lookup table extensions. This may lead to mismatched bank hashes while replaying.");
                                 }
                             }
                         }
@@ -3972,21 +3989,10 @@ fn main() {
                     force_update_to_open,
                     enforce_ulimit_nofile,
                 );
-                let max_height = if let Some(height) = arg_matches.value_of("max_height") {
-                    usize::from_str(height).expect("Maximum height must be a number")
-                } else {
-                    usize::MAX
-                };
-                let start_root = if let Some(height) = arg_matches.value_of("start_root") {
-                    Slot::from_str(height).expect("Starting root must be a number")
-                } else {
-                    0
-                };
-                let num_roots = if let Some(roots) = arg_matches.value_of("num_roots") {
-                    usize::from_str(roots).expect("Number of roots must be a number")
-                } else {
-                    usize::from_str(DEFAULT_ROOT_COUNT).unwrap()
-                };
+
+                let max_height = value_t!(arg_matches, "max_height", usize).unwrap_or(usize::MAX);
+                let start_root = value_t!(arg_matches, "start_root", Slot).unwrap_or(0);
+                let num_roots = value_t_or_exit!(arg_matches, "num_roots", usize);
 
                 let iter = blockstore
                     .rooted_slot_iterator(start_root)
@@ -4062,17 +4068,12 @@ fn main() {
                     force_update_to_open,
                     enforce_ulimit_nofile,
                 );
-                let start_root = if let Some(root) = arg_matches.value_of("start_root") {
-                    Slot::from_str(root).expect("Before root must be a number")
-                } else {
-                    blockstore.max_root()
-                };
+
+                let start_root = value_t!(arg_matches, "start_root", Slot)
+                    .unwrap_or_else(|_| blockstore.max_root());
                 let max_slots = value_t_or_exit!(arg_matches, "max_slots", u64);
-                let end_root = if let Some(root) = arg_matches.value_of("end_root") {
-                    Slot::from_str(root).expect("Until root must be a number")
-                } else {
-                    start_root.saturating_sub(max_slots)
-                };
+                let end_root = value_t!(arg_matches, "end_root", Slot)
+                    .unwrap_or_else(|_| start_root.saturating_sub(max_slots));
                 assert!(start_root > end_root);
                 let num_slots = start_root - end_root - 1; // Adjust by one since start_root need not be checked
                 if arg_matches.is_present("end_root") && num_slots > max_slots {

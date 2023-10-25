@@ -16,7 +16,7 @@ use {
         },
         ledger_metric_report_service::LedgerMetricReportService,
         poh_timing_report_service::PohTimingReportService,
-        repair::{serve_repair::ServeRepair, serve_repair_service::ServeRepairService},
+        repair::{self, serve_repair::ServeRepair, serve_repair_service::ServeRepairService},
         rewards_recorder_service::{RewardsRecorderSender, RewardsRecorderService},
         sample_performance_service::SamplePerformanceService,
         sigverify,
@@ -119,6 +119,7 @@ use {
     solana_streamer::{socket::SocketAddrSpace, streamer::StakedNodes},
     solana_turbine::{self, broadcast_stage::BroadcastStageType},
     solana_vote_program::vote_state,
+    solana_wen_restart::wen_restart::wait_for_wen_restart,
     std::{
         collections::{HashMap, HashSet},
         net::SocketAddr,
@@ -132,6 +133,7 @@ use {
     },
     strum::VariantNames,
     strum_macros::{Display, EnumString, EnumVariantNames, IntoStaticStr},
+    tokio::runtime::Runtime as TokioRuntime,
 };
 
 const MAX_COMPLETED_DATA_SETS_IN_CHANNEL: usize = 100_000;
@@ -244,6 +246,7 @@ pub struct ValidatorConfig {
     pub warp_slot: Option<Slot>,
     pub accounts_db_test_hash_calculation: bool,
     pub accounts_db_skip_shrink: bool,
+    pub accounts_db_force_initial_clean: bool,
     pub tpu_coalesce: Duration,
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub validator_exit: Arc<RwLock<Exit>>,
@@ -258,6 +261,7 @@ pub struct ValidatorConfig {
     pub block_production_method: BlockProductionMethod,
     pub generator_config: Option<GeneratorConfig>,
     pub use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup,
+    pub wen_restart_proto_path: Option<PathBuf>,
 }
 
 impl Default for ValidatorConfig {
@@ -310,6 +314,7 @@ impl Default for ValidatorConfig {
             warp_slot: None,
             accounts_db_test_hash_calculation: false,
             accounts_db_skip_shrink: false,
+            accounts_db_force_initial_clean: false,
             tpu_coalesce: DEFAULT_TPU_COALESCE,
             staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
             validator_exit: Arc::new(RwLock::new(Exit::default())),
@@ -325,6 +330,7 @@ impl Default for ValidatorConfig {
             block_production_method: BlockProductionMethod::default(),
             generator_config: None,
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
+            wen_restart_proto_path: None,
         }
     }
 }
@@ -463,8 +469,11 @@ pub struct Validator {
     accounts_background_service: AccountsBackgroundService,
     accounts_hash_verifier: AccountsHashVerifier,
     turbine_quic_endpoint: Endpoint,
-    turbine_quic_endpoint_runtime: Option<tokio::runtime::Runtime>,
+    turbine_quic_endpoint_runtime: Option<TokioRuntime>,
     turbine_quic_endpoint_join_handle: solana_turbine::quic_endpoint::AsyncTryJoinHandle,
+    repair_quic_endpoint: Endpoint,
+    repair_quic_endpoint_runtime: Option<TokioRuntime>,
+    repair_quic_endpoint_join_handle: repair::quic_endpoint::AsyncTryJoinHandle,
 }
 
 impl Validator {
@@ -554,6 +563,10 @@ impl Validator {
             ));
         }
 
+        let genesis_config =
+            open_genesis_config(ledger_path, config.max_genesis_archive_unpacked_size);
+        metrics_config_sanity_check(genesis_config.cluster_type)?;
+
         if let Some(expected_shred_version) = config.expected_shred_version {
             if let Some(wait_for_supermajority_slot) = config.wait_for_supermajority {
                 *start_progress.write().unwrap() = ValidatorStartProgress::CleaningBlockStore;
@@ -594,10 +607,23 @@ impl Validator {
         timer.stop();
         info!("Cleaning orphaned account snapshot directories done. {timer}");
 
-        // The accounts hash cache dir was renamed, so cleanup the old dir if it exists.
-        let old_accounts_hash_cache_dir = ledger_path.join("calculate_accounts_hash_cache");
-        if old_accounts_hash_cache_dir.exists() {
-            snapshot_utils::move_and_async_delete_path(old_accounts_hash_cache_dir);
+        // The accounts hash cache dir was renamed, so cleanup any old dirs that exist.
+        let accounts_hash_cache_path = config
+            .accounts_db_config
+            .as_ref()
+            .and_then(|config| config.accounts_hash_cache_path.as_ref())
+            .map(PathBuf::as_path)
+            .unwrap_or(ledger_path);
+        let old_accounts_hash_cache_dirs = [
+            ledger_path.join("calculate_accounts_hash_cache"),
+            accounts_hash_cache_path.join("full"),
+            accounts_hash_cache_path.join("incremental"),
+            accounts_hash_cache_path.join("transient"),
+        ];
+        for old_accounts_hash_cache_dir in old_accounts_hash_cache_dirs {
+            if old_accounts_hash_cache_dir.exists() {
+                snapshot_utils::move_and_async_delete_path(old_accounts_hash_cache_dir);
+            }
         }
 
         {
@@ -917,7 +943,8 @@ impl Validator {
         // (by both replay stage and banking stage)
         let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::default());
 
-        let rpc_override_health_check = Arc::new(AtomicBool::new(false));
+        let rpc_override_health_check =
+            Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
         let (
             json_rpc_service,
             pubsub_service,
@@ -954,7 +981,6 @@ impl Validator {
                 ledger_path,
                 config.validator_exit.clone(),
                 exit.clone(),
-                config.known_validators.clone(),
                 rpc_override_health_check.clone(),
                 startup_verification_complete,
                 optimistically_confirmed_bank.clone(),
@@ -1043,8 +1069,13 @@ impl Validator {
             bank_forks.clone(),
             config.repair_whitelist.clone(),
         );
+        let (repair_quic_endpoint_sender, repair_quic_endpoint_receiver) = unbounded();
         let serve_repair_service = ServeRepairService::new(
             serve_repair,
+            // Incoming UDP repair requests are adapted into RemoteRequest
+            // and also sent through the same channel.
+            repair_quic_endpoint_sender.clone(),
+            repair_quic_endpoint_receiver,
             blockstore.clone(),
             node.sockets.serve_repair,
             socket_addr_space,
@@ -1112,11 +1143,11 @@ impl Validator {
             .map_err(|err| format!("{} [{:?}]", &err, &err))?;
         if banking_tracer.is_enabled() {
             info!(
-                "Enabled banking tracer (dir_byte_limit: {})",
+                "Enabled banking trace (dir_byte_limit: {})",
                 config.banking_trace_dir_byte_limit
             );
         } else {
-            info!("Disabled banking tracer");
+            info!("Disabled banking trace");
         }
 
         let entry_notification_sender = entry_notifier_service
@@ -1144,7 +1175,7 @@ impl Validator {
         ) = solana_turbine::quic_endpoint::new_quic_endpoint(
             turbine_quic_endpoint_runtime
                 .as_ref()
-                .map(tokio::runtime::Runtime::handle)
+                .map(TokioRuntime::handle)
                 .unwrap_or_else(|| current_runtime_handle.as_ref().unwrap()),
             &identity_keypair,
             node.sockets.tvu_quic,
@@ -1153,8 +1184,50 @@ impl Validator {
                 .expect("Operator must spin up node with valid QUIC TVU address")
                 .ip(),
             turbine_quic_endpoint_sender,
+            bank_forks.clone(),
         )
         .unwrap();
+
+        // Repair quic endpoint.
+        let repair_quic_endpoint_runtime = current_runtime_handle.is_err().then(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("solRepairQuic")
+                .build()
+                .unwrap()
+        });
+        let (repair_quic_endpoint, repair_quic_endpoint_sender, repair_quic_endpoint_join_handle) =
+            repair::quic_endpoint::new_quic_endpoint(
+                repair_quic_endpoint_runtime
+                    .as_ref()
+                    .map(TokioRuntime::handle)
+                    .unwrap_or_else(|| current_runtime_handle.as_ref().unwrap()),
+                &identity_keypair,
+                node.sockets.serve_repair_quic,
+                node.info
+                    .serve_repair(Protocol::QUIC)
+                    .expect("Operator must spin up node with valid QUIC serve-repair address")
+                    .ip(),
+                repair_quic_endpoint_sender,
+                bank_forks.clone(),
+            )
+            .unwrap();
+
+        let in_wen_restart = config.wen_restart_proto_path.is_some() && !waited_for_supermajority;
+        let tower = match process_blockstore.process_to_create_tower() {
+            Ok(tower) => {
+                info!("Tower state: {:?}", tower);
+                tower
+            }
+            Err(e) => {
+                warn!(
+                    "Unable to retrieve tower: {:?} creating default tower....",
+                    e
+                );
+                Tower::default()
+            }
+        };
+        let last_vote = tower.last_vote();
 
         let (replay_vote_sender, replay_vote_receiver) = unbounded();
         let tvu = Tvu::new(
@@ -1172,7 +1245,7 @@ impl Validator {
             ledger_signal_receiver,
             &rpc_subscriptions,
             &poh_recorder,
-            Some(process_blockstore),
+            tower,
             config.tower_storage.clone(),
             &leader_schedule_cache,
             exit.clone(),
@@ -1208,7 +1281,23 @@ impl Validator {
             banking_tracer.clone(),
             turbine_quic_endpoint_sender.clone(),
             turbine_quic_endpoint_receiver,
+            repair_quic_endpoint_sender,
         )?;
+
+        if in_wen_restart {
+            info!("Waiting for wen_restart phase one to finish");
+            match wait_for_wen_restart(
+                &config.wen_restart_proto_path.clone().unwrap(),
+                last_vote,
+                blockstore.clone(),
+                cluster_info.clone(),
+            ) {
+                Ok(()) => {
+                    return Err("wen_restart phase one completedy".to_string());
+                }
+                Err(e) => return Err(format!("wait_for_wen_restart failed: {e:?}")),
+            };
+        }
 
         let tpu = Tpu::new(
             &cluster_info,
@@ -1249,17 +1338,15 @@ impl Validator {
             tracer_thread,
             tpu_enable_udp,
             &prioritization_fee_cache,
+            config.block_production_method.clone(),
             config.generator_config.clone(),
         );
-
-        let cluster_type = bank_forks.read().unwrap().root_bank().cluster_type();
-        metrics_config_sanity_check(cluster_type)?;
 
         datapoint_info!(
             "validator-new",
             ("id", id.to_string(), String),
             ("version", solana_version::version!(), String),
-            ("cluster_type", cluster_type as u32, i64),
+            ("cluster_type", genesis_config.cluster_type as u32, i64),
         );
 
         *start_progress.write().unwrap() = ValidatorStartProgress::Running;
@@ -1296,6 +1383,9 @@ impl Validator {
             turbine_quic_endpoint,
             turbine_quic_endpoint_runtime,
             turbine_quic_endpoint_join_handle,
+            repair_quic_endpoint,
+            repair_quic_endpoint_runtime,
+            repair_quic_endpoint_join_handle,
         })
     }
 
@@ -1405,9 +1495,14 @@ impl Validator {
         }
 
         self.gossip_service.join().expect("gossip_service");
+        repair::quic_endpoint::close_quic_endpoint(&self.repair_quic_endpoint);
         self.serve_repair_service
             .join()
             .expect("serve_repair_service");
+        self.repair_quic_endpoint_runtime
+            .map(|runtime| runtime.block_on(self.repair_quic_endpoint_join_handle))
+            .transpose()
+            .unwrap();
         self.stats_reporter_service
             .join()
             .expect("stats_reporter_service");
@@ -1668,6 +1763,7 @@ fn load_blockstore(
         shrink_ratio: config.accounts_shrink_ratio,
         accounts_db_test_hash_calculation: config.accounts_db_test_hash_calculation,
         accounts_db_skip_shrink: config.accounts_db_skip_shrink,
+        accounts_db_force_initial_clean: config.accounts_db_force_initial_clean,
         runtime_config: config.runtime_config.clone(),
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         ..blockstore_processor::ProcessOptions::default()

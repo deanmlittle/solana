@@ -159,7 +159,7 @@ New feature gates should also always have a corresponding tracking issue
 and should be updated each time the feature is activated on a cluster.
 
 * "automerge": When a PR is labelled with "automerge", the PR will be
-automically merged once CI passes.  In general, this label should only
+automatically merged once CI passes.  In general, this label should only
 be used for small hot-fix (fewer than 100 lines) or automatic generated
 PRs.  If you're uncertain, it's usually the case that the PR is not
 qualified as "automerge".
@@ -250,7 +250,7 @@ before the PR can be merged.  Here are the steps:
 * Under the newly-created directory, create a Cargo.toml file.  Below is an
   example template:
 
-```
+```toml
 [package]
 name = "solana-<PACKAGE_NAME>"
 version = "0.0.1"
@@ -285,7 +285,9 @@ edition = "2021"
 * All Rust code is linted with Clippy. If you'd prefer to ignore its advice, do
   so explicitly:
 
-  ```rust #[allow(clippy::too_many_arguments)] ```
+  ```rust
+  #[allow(clippy::too_many_arguments)]
+  ```
 
   Note: Clippy defaults can be overridden in the top-level file `.clippy.toml`.
 

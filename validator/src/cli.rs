@@ -258,11 +258,9 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .value_name("SLOT_DISTANCE")
                 .takes_value(true)
                 .default_value(&default_args.health_check_slot_distance)
-                .help("If --known-validators are specified, report this validator healthy \
-                       if its latest account hash is no further behind than this number of \
-                       slots from the latest known validator account hash. \
-                       If no --known-validators are specified, the validator will always \
-                       report itself to be healthy")
+                .help("Report this validator healthy if its latest optimistically confirmed slot \
+                       that has been replayed is no further behind than this number of slots from \
+                       the cluster latest optimistically confirmed slot")
         )
         .arg(
             Arg::with_name("rpc_faucet_addr")
@@ -293,7 +291,7 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .long("accounts-hash-cache-path")
                 .value_name("PATH")
                 .takes_value(true)
-                .help("Use PATH as accounts hash cache location"),
+                .help("Use PATH as accounts hash cache location [default: <LEDGER>/accounts_hash_cache]"),
         )
         .arg(
             Arg::with_name("snapshots")
@@ -305,7 +303,6 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
         .arg(
             Arg::with_name(use_snapshot_archives_at_startup::cli::NAME)
                 .long(use_snapshot_archives_at_startup::cli::LONG_ARG)
-                .hidden(hidden_unless_forced())
                 .takes_value(true)
                 .possible_values(use_snapshot_archives_at_startup::cli::POSSIBLE_VALUES)
                 .default_value(use_snapshot_archives_at_startup::cli::default_value())
@@ -469,7 +466,8 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .value_name("NUMBER")
                 .takes_value(true)
                 .default_value(&default_args.full_snapshot_archive_interval_slots)
-                .help("Number of slots between generating full snapshots")
+                .help("Number of slots between generating full snapshots. \
+                    Must be a multiple of the incremental snapshot interval.")
         )
         .arg(
             Arg::with_name("maximum_full_snapshots_to_retain")
@@ -1197,6 +1195,13 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .hidden(hidden_unless_forced())
         )
         .arg(
+            Arg::with_name("no_skip_initial_accounts_db_clean")
+                .long("no-skip-initial-accounts-db-clean")
+                .help("Do not skip the initial cleaning of accounts when verifying snapshot bank")
+                .hidden(hidden_unless_forced())
+                .conflicts_with("accounts_db_skip_shrink")
+        )
+        .arg(
             Arg::with_name("accounts_db_create_ancient_storage_packed")
                 .long("accounts-db-create-ancient-storage-packed")
                 .help("Create ancient storages in one shot instead of appending.")
@@ -1352,9 +1357,17 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 // explicitly given, similar to --limit-ledger-size.
                 // see configure_banking_trace_dir_byte_limit() for this.
                 .default_value(&default_args.banking_trace_dir_byte_limit)
-                .help("Write trace files for simulate-leader-blocks, retaining \
-                       up to the default or specified total bytes in the \
-                       ledger")
+                .help("Enables the banking trace explicitly, which is enabled by default and \
+                       writes trace files for simulate-leader-blocks, retaining up to the default \
+                       or specified total bytes in the ledger. This flag can be used to override \
+                       its byte limit.")
+        )
+        .arg(
+            Arg::with_name("disable_banking_trace")
+                .long("disable-banking-trace")
+                .conflicts_with("banking_trace_dir_byte_limit")
+                .takes_value(false)
+                .help("Disables the banking trace")
         )
         .arg(
             Arg::with_name("block_verification_method")
@@ -1373,6 +1386,35 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                 .takes_value(true)
                 .possible_values(BlockProductionMethod::cli_names())
                 .help(BlockProductionMethod::cli_message())
+        )
+        .arg(
+            Arg::with_name("wen_restart")
+                .long("wen-restart")
+                .hidden(hidden_unless_forced())
+                .value_name("DIR")
+                .takes_value(true)
+                .required(false)
+                .conflicts_with("wait_for_supermajority")
+                .help(
+                    "When specified, the validator will enter Wen Restart mode which
+                    pauses normal activity. Validators in this mode will gossip their last
+                    vote to reach consensus on a safe restart slot and repair all blocks
+                    on the selected fork. The safe slot will be a descendant of the latest
+                    optimistically confirmed slot to ensure we do not roll back any
+                    optimistically confirmed slots.
+
+                    The progress in this mode will be saved in the file location provided.
+                    If consensus is reached, the validator will automatically exit and then
+                    execute wait_for_supermajority logic so the cluster will resume execution.
+                    The progress file will be kept around for future debugging.
+
+                    After the cluster resumes normal operation, the validator arguments can
+                    be adjusted to remove --wen_restart and update expected_shred_version to
+                    the new shred_version agreed on in the consensus.
+
+                    If wen_restart fails, refer to the progress file (in proto3 format) for
+                    further debugging.
+                ")
         )
         .args(&get_deprecated_arguments())
         .after_help("The default subcommand is run")
@@ -1415,6 +1457,11 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                     Arg::with_name("skip_new_snapshot_check")
                         .long("skip-new-snapshot-check")
                         .help("Skip check for a new snapshot")
+                )
+                .arg(
+                    Arg::with_name("skip_health_check")
+                        .long("skip-health-check")
+                        .help("Skip health check")
                 )
         )
         .subcommand(
@@ -1630,6 +1677,11 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
                     Arg::with_name("skip_new_snapshot_check")
                         .long("skip-new-snapshot-check")
                         .help("Skip check for a new snapshot")
+                )
+                .arg(
+                    Arg::with_name("skip_health_check")
+                        .long("skip-health-check")
+                        .help("Skip health check")
                 )
                 .after_help("Note: If this command exits with a non-zero status \
                          then this not a good time for a restart")
@@ -1923,6 +1975,8 @@ pub struct DefaultArgs {
     pub wait_for_restart_window_max_delinquent_stake: String,
 
     pub banking_trace_dir_byte_limit: String,
+
+    pub wen_restart_path: String,
 }
 
 impl DefaultArgs {
@@ -2001,6 +2055,7 @@ impl DefaultArgs {
             wait_for_restart_window_min_idle_time: "10".to_string(),
             wait_for_restart_window_max_delinquent_stake: "5".to_string(),
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
+            wen_restart_path: "wen_restart_progress.proto".to_string(),
         }
     }
 }

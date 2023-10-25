@@ -14,18 +14,19 @@ pub mod writer;
 use {
     crate::{
         account_storage::meta::{StorableAccountsWithHashesAndWriteVersions, StoredAccountInfo},
+        accounts_hash::AccountHash,
         storable_accounts::StorableAccounts,
     },
     error::TieredStorageError,
     footer::{AccountBlockFormat, AccountMetaFormat, OwnersBlockFormat},
     index::AccountIndexFormat,
-    once_cell::sync::OnceCell,
     readable::TieredStorageReader,
-    solana_sdk::{account::ReadableAccount, hash::Hash},
+    solana_sdk::account::ReadableAccount,
     std::{
         borrow::Borrow,
         fs::OpenOptions,
         path::{Path, PathBuf},
+        sync::OnceLock,
     },
     writer::TieredStorageWriter,
 };
@@ -45,8 +46,7 @@ pub struct TieredStorageFormat {
 
 #[derive(Debug)]
 pub struct TieredStorage {
-    reader: OnceCell<TieredStorageReader>,
-    format: Option<TieredStorageFormat>,
+    reader: OnceLock<TieredStorageReader>,
     path: PathBuf,
 }
 
@@ -64,10 +64,9 @@ impl TieredStorage {
     ///
     /// Note that the actual file will not be created until write_accounts
     /// is called.
-    pub fn new_writable(path: impl Into<PathBuf>, format: TieredStorageFormat) -> Self {
+    pub fn new_writable(path: impl Into<PathBuf>) -> Self {
         Self {
-            reader: OnceCell::<TieredStorageReader>::new(),
-            format: Some(format),
+            reader: OnceLock::<TieredStorageReader>::new(),
             path: path.into(),
         }
     }
@@ -77,8 +76,7 @@ impl TieredStorage {
     pub fn new_readonly(path: impl Into<PathBuf>) -> TieredStorageResult<Self> {
         let path = path.into();
         Ok(Self {
-            reader: OnceCell::with_value(TieredStorageReader::new_from_path(&path)?),
-            format: None,
+            reader: TieredStorageReader::new_from_path(&path).map(OnceLock::from)?,
             path,
         })
     }
@@ -99,11 +97,12 @@ impl TieredStorage {
         'b,
         T: ReadableAccount + Sync,
         U: StorableAccounts<'a, T>,
-        V: Borrow<Hash>,
+        V: Borrow<AccountHash>,
     >(
         &self,
         accounts: &StorableAccountsWithHashesAndWriteVersions<'a, 'b, T, U, V>,
         skip: usize,
+        format: &TieredStorageFormat,
     ) -> TieredStorageResult<Vec<StoredAccountInfo>> {
         if self.is_read_only() {
             return Err(TieredStorageError::AttemptToUpdateReadOnly(
@@ -112,10 +111,7 @@ impl TieredStorage {
         }
 
         let result = {
-            // self.format must be Some as write_accounts can only be called on a
-            // TieredStorage instance created via new_writable() where its format
-            // field is required.
-            let writer = TieredStorageWriter::new(&self.path, self.format.as_ref().unwrap())?;
+            let writer = TieredStorageWriter::new(&self.path, format)?;
             writer.write_accounts(accounts, skip)
         };
 
@@ -162,6 +158,7 @@ mod tests {
         solana_sdk::{
             account::{Account, AccountSharedData},
             clock::Slot,
+            hash::Hash,
             pubkey::Pubkey,
             system_instruction::MAX_PERMITTED_DATA_LENGTH,
         },
@@ -187,11 +184,11 @@ mod tests {
         let storable_accounts =
             StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
                 &account_data,
-                Vec::<&Hash>::new(),
+                Vec::<AccountHash>::new(),
                 Vec::<StoredMetaWriteVersion>::new(),
             );
 
-        let result = tiered_storage.write_accounts(&storable_accounts, 0);
+        let result = tiered_storage.write_accounts(&storable_accounts, 0, &HOT_FORMAT);
 
         match (&result, &expected_result) {
             (
@@ -220,10 +217,8 @@ mod tests {
         let tiered_storage_path = temp_dir.path().join("test_new_meta_file_only");
 
         {
-            let tiered_storage = ManuallyDrop::new(TieredStorage::new_writable(
-                &tiered_storage_path,
-                HOT_FORMAT.clone(),
-            ));
+            let tiered_storage =
+                ManuallyDrop::new(TieredStorage::new_writable(&tiered_storage_path));
 
             assert!(!tiered_storage.is_read_only());
             assert_eq!(tiered_storage.path(), tiered_storage_path);
@@ -256,7 +251,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let tiered_storage_path = temp_dir.path().join("test_write_accounts_twice");
 
-        let tiered_storage = TieredStorage::new_writable(&tiered_storage_path, HOT_FORMAT.clone());
+        let tiered_storage = TieredStorage::new_writable(&tiered_storage_path);
         // Expect the result to be TieredStorageError::Unsupported as the feature
         // is not yet fully supported, but we can still check its partial results
         // in the test.
@@ -277,18 +272,15 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let tiered_storage_path = temp_dir.path().join("test_remove_on_drop");
         {
-            let tiered_storage =
-                TieredStorage::new_writable(&tiered_storage_path, HOT_FORMAT.clone());
+            let tiered_storage = TieredStorage::new_writable(&tiered_storage_path);
             write_zero_accounts(&tiered_storage, Err(TieredStorageError::Unsupported()));
         }
         // expect the file does not exists as it has been removed on drop
         assert!(!tiered_storage_path.try_exists().unwrap());
 
         {
-            let tiered_storage = ManuallyDrop::new(TieredStorage::new_writable(
-                &tiered_storage_path,
-                HOT_FORMAT.clone(),
-            ));
+            let tiered_storage =
+                ManuallyDrop::new(TieredStorage::new_writable(&tiered_storage_path));
             write_zero_accounts(&tiered_storage, Err(TieredStorageError::Unsupported()));
         }
         // expect the file exists as we have ManuallyDrop this time.
@@ -310,8 +302,6 @@ mod tests {
     }
 
     /// Create a test account based on the specified seed.
-    /// The created test account might have default rent_epoch
-    /// and write_version.
     fn create_account(seed: u64) -> (StoredMeta, AccountSharedData) {
         let data_byte = seed as u8;
         let account = Account {
@@ -327,7 +317,7 @@ mod tests {
         };
 
         let stored_meta = StoredMeta {
-            write_version_obsolete: u64::MAX,
+            write_version_obsolete: StoredMetaWriteVersion::default(),
             pubkey: Pubkey::new_unique(),
             data_len: seed,
         };
@@ -353,7 +343,7 @@ mod tests {
 
         // Slot information is not used here
         let account_data = (Slot::MAX, &account_refs[..]);
-        let hashes: Vec<_> = std::iter::repeat_with(Hash::new_unique)
+        let hashes: Vec<_> = std::iter::repeat_with(|| AccountHash(Hash::new_unique()))
             .take(account_data_sizes.len())
             .collect();
         let write_versions: Vec<_> = accounts
@@ -370,8 +360,8 @@ mod tests {
 
         let temp_dir = tempdir().unwrap();
         let tiered_storage_path = temp_dir.path().join(path_suffix);
-        let tiered_storage = TieredStorage::new_writable(tiered_storage_path, format.clone());
-        _ = tiered_storage.write_accounts(&storable_accounts, 0);
+        let tiered_storage = TieredStorage::new_writable(tiered_storage_path);
+        _ = tiered_storage.write_accounts(&storable_accounts, 0, &format);
 
         verify_hot_storage(&tiered_storage, &accounts, format);
     }

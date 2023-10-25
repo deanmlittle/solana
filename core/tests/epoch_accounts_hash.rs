@@ -461,6 +461,7 @@ fn test_snapshots_have_expected_epoch_accounts_hash() {
                 AccountShrinkThreshold::default(),
                 true,
                 true,
+                false,
                 true,
                 None,
                 None,
@@ -529,7 +530,7 @@ fn test_background_services_request_handling_for_epoch_accounts_hash() {
         // Based on the EAH start and snapshot interval, pick a slot to mass-root all the banks in
         // this range such that an EAH request will be sent and also a snapshot request.
         let eah_start_slot = epoch_accounts_hash_utils::calculation_start(&bank);
-        let set_root_slot = next_multiple_of(eah_start_slot, FULL_SNAPSHOT_INTERVAL);
+        let set_root_slot = eah_start_slot.next_multiple_of(FULL_SNAPSHOT_INTERVAL);
 
         if bank.block_height() == set_root_slot {
             info!("Calling set_root() on bank {}...", bank.slot());
@@ -598,18 +599,22 @@ fn test_epoch_accounts_hash_and_warping() {
     );
     // flush the write cache so warping can calculate the accounts hash from storages
     bank.force_flush_accounts_cache();
-    let bank = bank_forks.write().unwrap().insert(Bank::warp_from_parent(
-        bank,
-        &Pubkey::default(),
-        eah_stop_slot_in_next_epoch,
-        CalcAccountsHashDataSource::Storages,
-    ));
+    let bank = bank_forks
+        .write()
+        .unwrap()
+        .insert(Bank::warp_from_parent(
+            bank,
+            &Pubkey::default(),
+            eah_stop_slot_in_next_epoch,
+            CalcAccountsHashDataSource::Storages,
+        ))
+        .clone_without_scheduler();
     let slot = bank.slot().checked_add(1).unwrap();
-    let bank =
-        bank_forks
-            .write()
-            .unwrap()
-            .insert(Bank::new_from_parent(bank, &Pubkey::default(), slot));
+    let bank = bank_forks
+        .write()
+        .unwrap()
+        .insert(Bank::new_from_parent(bank, &Pubkey::default(), slot))
+        .clone_without_scheduler();
     bank_forks.write().unwrap().set_root(
         bank.slot(),
         &test_environment
@@ -633,18 +638,22 @@ fn test_epoch_accounts_hash_and_warping() {
         epoch_schedule.get_first_slot_in_epoch(bank.epoch() + 1) + eah_start_offset;
     // flush the write cache so warping can calculate the accounts hash from storages
     bank.force_flush_accounts_cache();
-    let bank = bank_forks.write().unwrap().insert(Bank::warp_from_parent(
-        bank,
-        &Pubkey::default(),
-        eah_start_slot_in_next_epoch,
-        CalcAccountsHashDataSource::Storages,
-    ));
+    let bank = bank_forks
+        .write()
+        .unwrap()
+        .insert(Bank::warp_from_parent(
+            bank,
+            &Pubkey::default(),
+            eah_start_slot_in_next_epoch,
+            CalcAccountsHashDataSource::Storages,
+        ))
+        .clone_without_scheduler();
     let slot = bank.slot().checked_add(1).unwrap();
-    let bank =
-        bank_forks
-            .write()
-            .unwrap()
-            .insert(Bank::new_from_parent(bank, &Pubkey::default(), slot));
+    let bank = bank_forks
+        .write()
+        .unwrap()
+        .insert(Bank::new_from_parent(bank, &Pubkey::default(), slot))
+        .clone_without_scheduler();
     bank_forks.write().unwrap().set_root(
         bank.slot(),
         &test_environment
@@ -660,17 +669,4 @@ fn test_epoch_accounts_hash_and_warping() {
         .epoch_accounts_hash_manager
         .wait_get_epoch_accounts_hash();
     info!("Waiting for epoch accounts hash... DONE");
-}
-
-// Copy the impl of `next_multiple_of` since it is nightly-only experimental.
-// https://doc.rust-lang.org/std/primitive.u64.html#method.next_multiple_of
-// https://github.com/rust-lang/rust/issues/88581
-// https://github.com/rust-lang/rust/pull/88582
-// https://github.com/jhpratt/rust/blob/727a4fc7e3f836938dfeb4a2ab237cfca612222d/library/core/src/num/uint_macros.rs#L1811-L1837
-const fn next_multiple_of(lhs: u64, rhs: u64) -> u64 {
-    #![allow(clippy::arithmetic_side_effects)]
-    match lhs % rhs {
-        0 => lhs,
-        r => lhs + (rhs - r),
-    }
 }

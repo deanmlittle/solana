@@ -18,12 +18,14 @@ use {
     },
     solana_rbpf::{
         aligned_memory::AlignedMemory,
+        declare_builtin_function,
         ebpf::{self, HOST_ALIGN, MM_HEAP_START},
         elf::Executable,
-        error::EbpfError,
+        error::{EbpfError, ProgramResult},
         memory_region::{AccessType, MemoryCowCallback, MemoryMapping, MemoryRegion},
+        program::BuiltinProgram,
         verifier::RequisiteVerifier,
-        vm::{BuiltinProgram, ContextObject, EbpfVm, ProgramResult},
+        vm::{ContextObject, EbpfVm},
     },
     solana_sdk::{
         account::WritableAccount,
@@ -32,19 +34,16 @@ use {
         clock::Slot,
         entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
         feature_set::{
-            bpf_account_data_direct_mapping, cap_accounts_data_allocations_per_transaction,
-            cap_bpf_program_instruction_accounts, delay_visibility_of_program_deployment,
+            bpf_account_data_direct_mapping, delay_visibility_of_program_deployment,
             enable_bpf_loader_extend_program_ix, enable_bpf_loader_set_authority_checked_ix,
             enable_program_redeployment_cooldown, limit_max_instruction_trace_length,
-            native_programs_consume_cu, remove_bpf_loader_incorrect_program_id, FeatureSet,
+            native_programs_consume_cu, remove_bpf_loader_incorrect_program_id,
         },
         instruction::{AccountMeta, InstructionError},
         loader_instruction::LoaderInstruction,
         loader_upgradeable_instruction::UpgradeableLoaderInstruction,
         native_loader,
-        program_error::{
-            MAX_ACCOUNTS_DATA_ALLOCATIONS_EXCEEDED, MAX_INSTRUCTION_TRACE_LENGTH_EXCEEDED,
-        },
+        program_error::MAX_INSTRUCTION_TRACE_LENGTH_EXCEEDED,
         program_utils::limited_deserialize,
         pubkey::Pubkey,
         saturating_add_assign,
@@ -68,7 +67,7 @@ pub const UPGRADEABLE_LOADER_COMPUTE_UNITS: u64 = 2_370;
 
 #[allow(clippy::too_many_arguments)]
 pub fn load_program_from_bytes(
-    feature_set: &FeatureSet,
+    delay_visibility_of_program_deployment: bool,
     log_collector: Option<Rc<RefCell<LogCollector>>>,
     load_program_metrics: &mut LoadProgramMetrics,
     programdata: &[u8],
@@ -76,22 +75,39 @@ pub fn load_program_from_bytes(
     account_size: usize,
     deployment_slot: Slot,
     program_runtime_environment: Arc<BuiltinProgram<InvokeContext<'static>>>,
+    reloading: bool,
 ) -> Result<LoadedProgram, InstructionError> {
-    let effective_slot = if feature_set.is_active(&delay_visibility_of_program_deployment::id()) {
+    let effective_slot = if delay_visibility_of_program_deployment {
         deployment_slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET)
     } else {
         deployment_slot
     };
-    let loaded_program = LoadedProgram::new(
-        loader_key,
-        program_runtime_environment,
-        deployment_slot,
-        effective_slot,
-        None,
-        programdata,
-        account_size,
-        load_program_metrics,
-    )
+    let loaded_program = if reloading {
+        // Safety: this is safe because the program is being reloaded in the cache.
+        unsafe {
+            LoadedProgram::reload(
+                loader_key,
+                program_runtime_environment,
+                deployment_slot,
+                effective_slot,
+                None,
+                programdata,
+                account_size,
+                load_program_metrics,
+            )
+        }
+    } else {
+        LoadedProgram::new(
+            loader_key,
+            program_runtime_environment,
+            deployment_slot,
+            effective_slot,
+            None,
+            programdata,
+            account_size,
+            load_program_metrics,
+        )
+    }
     .map_err(|err| {
         ic_logger_msg!(log_collector, "{}", err);
         InstructionError::InvalidAccountData
@@ -104,7 +120,7 @@ macro_rules! deploy_program {
      $account_size:expr, $slot:expr, $drop:expr, $new_programdata:expr $(,)?) => {{
         let mut load_program_metrics = LoadProgramMetrics::default();
         let mut register_syscalls_time = Measure::start("register_syscalls_time");
-        let program_runtime_environment = create_program_runtime_environment_v1(
+        let deployment_program_runtime_environment = create_program_runtime_environment_v1(
             &$invoke_context.feature_set,
             $invoke_context.get_compute_budget(),
             true, /* deployment */
@@ -115,15 +131,35 @@ macro_rules! deploy_program {
         })?;
         register_syscalls_time.stop();
         load_program_metrics.register_syscalls_us = register_syscalls_time.as_us();
+        // Verify using stricter deployment_program_runtime_environment
+        let mut load_elf_time = Measure::start("load_elf_time");
+        let executable = Executable::<InvokeContext>::load(
+            $new_programdata,
+            Arc::new(deployment_program_runtime_environment),
+        ).map_err(|err| {
+            ic_logger_msg!($invoke_context.get_log_collector(), "{}", err);
+            InstructionError::InvalidAccountData
+        })?;
+        load_elf_time.stop();
+        load_program_metrics.load_elf_us = load_elf_time.as_us();
+        let mut verify_code_time = Measure::start("verify_code_time");
+        executable.verify::<RequisiteVerifier>().map_err(|err| {
+            ic_logger_msg!($invoke_context.get_log_collector(), "{}", err);
+            InstructionError::InvalidAccountData
+        })?;
+        verify_code_time.stop();
+        load_program_metrics.verify_code_us = verify_code_time.as_us();
+        // Reload but with environments.program_runtime_v1
         let executor = load_program_from_bytes(
-            &$invoke_context.feature_set,
+            $invoke_context.feature_set.is_active(&delay_visibility_of_program_deployment::id()),
             $invoke_context.get_log_collector(),
             &mut load_program_metrics,
             $new_programdata,
             $loader_key,
             $account_size,
             $slot,
-            Arc::new(program_runtime_environment),
+            $invoke_context.programs_modified_by_tx.environments.program_runtime_v1.clone(),
+            true,
         )?;
         if let Some(old_entry) = $invoke_context.find_program_in_cache(&$program_id) {
             executor.tx_usage_counter.store(
@@ -174,10 +210,10 @@ pub fn check_loader_id(id: &Pubkey) -> bool {
 }
 
 /// Only used in macro, do not use directly!
-pub fn calculate_heap_cost(heap_size: u64, heap_cost: u64, enable_rounding_fix: bool) -> u64 {
+pub fn calculate_heap_cost(heap_size: u32, heap_cost: u64, enable_rounding_fix: bool) -> u64 {
     const KIBIBYTE: u64 = 1024;
     const PAGE_SIZE_KB: u64 = 32;
-    let mut rounded_heap_size = heap_size;
+    let mut rounded_heap_size = u64::from(heap_size);
     if enable_rounding_fix {
         rounded_heap_size = rounded_heap_size
             .saturating_add(PAGE_SIZE_KB.saturating_mul(KIBIBYTE).saturating_sub(1));
@@ -191,7 +227,7 @@ pub fn calculate_heap_cost(heap_size: u64, heap_cost: u64, enable_rounding_fix: 
 
 /// Only used in macro, do not use directly!
 pub fn create_vm<'a, 'b>(
-    program: &'a Executable<RequisiteVerifier, InvokeContext<'b>>,
+    program: &'a Executable<InvokeContext<'b>>,
     regions: Vec<MemoryRegion>,
     accounts_metadata: Vec<SerializedAccountMetadata>,
     invoke_context: &'a mut InvokeContext<'b>,
@@ -231,7 +267,7 @@ pub fn create_vm<'a, 'b>(
         trace_log: Vec::new(),
     })?;
     Ok(EbpfVm::new(
-        program.get_config(),
+        program.get_loader().clone(),
         program.get_sbpf_version(),
         invoke_context,
         memory_mapping,
@@ -245,15 +281,12 @@ macro_rules! create_vm {
     ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $invoke_context:expr $(,)?) => {
         let invoke_context = &*$invoke_context;
         let stack_size = $program.get_config().stack_size();
-        let heap_size = invoke_context
-            .get_compute_budget()
-            .heap_size
-            .unwrap_or(solana_sdk::entrypoint::HEAP_LENGTH);
+        let heap_size = invoke_context.get_compute_budget().heap_size;
         let round_up_heap_size = invoke_context
             .feature_set
             .is_active(&solana_sdk::feature_set::round_up_heap_size::id());
         let mut heap_cost_result = invoke_context.consume_checked($crate::calculate_heap_cost(
-            heap_size as u64,
+            heap_size,
             invoke_context.get_compute_budget().heap_cost,
             round_up_heap_size,
         ));
@@ -267,7 +300,7 @@ macro_rules! create_vm {
             >::zero_filled(stack_size);
             let mut heap = solana_rbpf::aligned_memory::AlignedMemory::<
                 { solana_rbpf::ebpf::HOST_ALIGN },
-            >::zero_filled(heap_size);
+            >::zero_filled(usize::try_from(heap_size).unwrap());
             let vm = $crate::create_vm(
                 $program,
                 $regions,
@@ -285,24 +318,21 @@ macro_rules! create_vm {
 #[macro_export]
 macro_rules! mock_create_vm {
     ($vm:ident, $additional_regions:expr, $accounts_metadata:expr, $invoke_context:expr $(,)?) => {
-        let loader = std::sync::Arc::new(BuiltinProgram::new_loader(
-            solana_rbpf::vm::Config::default(),
-        ));
-        let function_registry = solana_rbpf::vm::FunctionRegistry::default();
-        let executable = solana_rbpf::elf::Executable::<
-            solana_rbpf::verifier::TautologyVerifier,
-            InvokeContext,
-        >::from_text_bytes(
+        let loader = std::sync::Arc::new(BuiltinProgram::new_mock());
+        let function_registry = solana_rbpf::program::FunctionRegistry::default();
+        let executable = solana_rbpf::elf::Executable::<InvokeContext>::from_text_bytes(
             &[0x95, 0, 0, 0, 0, 0, 0, 0],
             loader,
             SBPFVersion::V2,
             function_registry,
         )
         .unwrap();
-        let verified_executable = solana_rbpf::elf::Executable::verified(executable).unwrap();
+        executable
+            .verify::<solana_rbpf::verifier::RequisiteVerifier>()
+            .unwrap();
         $crate::create_vm!(
             $vm,
-            &verified_executable,
+            &executable,
             $additional_regions,
             $accounts_metadata,
             $invoke_context,
@@ -311,7 +341,7 @@ macro_rules! mock_create_vm {
 }
 
 fn create_memory_mapping<'a, 'b, C: ContextObject>(
-    executable: &'a Executable<RequisiteVerifier, C>,
+    executable: &'a Executable<C>,
     stack: &'b mut AlignedMemory<{ HOST_ALIGN }>,
     heap: &'b mut AlignedMemory<{ HOST_ALIGN }>,
     additional_regions: Vec<MemoryRegion>,
@@ -343,20 +373,22 @@ fn create_memory_mapping<'a, 'b, C: ContextObject>(
     })
 }
 
-pub fn process_instruction(
-    invoke_context: &mut InvokeContext,
-    _arg0: u64,
-    _arg1: u64,
-    _arg2: u64,
-    _arg3: u64,
-    _arg4: u64,
-    _memory_mapping: &mut MemoryMapping,
-    result: &mut ProgramResult,
-) {
-    *result = process_instruction_inner(invoke_context).into();
-}
+declare_builtin_function!(
+    Entrypoint,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _arg0: u64,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        process_instruction_inner(invoke_context)
+    }
+);
 
-fn process_instruction_inner(
+pub fn process_instruction_inner(
     invoke_context: &mut InvokeContext,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let log_collector = invoke_context.get_log_collector();
@@ -498,12 +530,10 @@ fn process_instruction_inner(
     let mut get_or_create_executor_time = Measure::start("get_or_create_executor_time");
     let executor = invoke_context
         .find_program_in_cache(program_account.get_key())
-        .ok_or(InstructionError::InvalidAccountData)?;
-
-    if executor.is_tombstone() {
-        return Err(Box::new(InstructionError::InvalidAccountData));
-    }
-
+        .ok_or_else(|| {
+            ic_logger_msg!(log_collector, "Program is not cached");
+            InstructionError::InvalidAccountData
+        })?;
     drop(program_account);
     get_or_create_executor_time.stop();
     saturating_add_assign!(
@@ -516,6 +546,7 @@ fn process_instruction_inner(
         LoadedProgramType::FailedVerification(_)
         | LoadedProgramType::Closed
         | LoadedProgramType::DelayVisibility => {
+            ic_logger_msg!(log_collector, "Program is not deployed");
             Err(Box::new(InstructionError::InvalidAccountData) as Box<dyn std::error::Error>)
         }
         LoadedProgramType::LegacyV0(executable) => execute(executable, invoke_context),
@@ -1484,14 +1515,12 @@ fn process_loader_instruction(invoke_context: &mut InvokeContext) -> Result<(), 
 }
 
 fn execute<'a, 'b: 'a>(
-    executable: &'a Executable<RequisiteVerifier, InvokeContext<'static>>,
+    executable: &'a Executable<InvokeContext<'static>>,
     invoke_context: &'a mut InvokeContext<'b>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // We dropped the lifetime tracking in the Executor by setting it to 'static,
     // thus we need to reintroduce the correct lifetime of InvokeContext here again.
-    let executable = unsafe {
-        mem::transmute::<_, &'a Executable<RequisiteVerifier, InvokeContext<'b>>>(executable)
-    };
+    let executable = unsafe { mem::transmute::<_, &'a Executable<InvokeContext<'b>>>(executable) };
     let log_collector = invoke_context.get_log_collector();
     let transaction_context = &invoke_context.transaction_context;
     let instruction_context = transaction_context.get_current_instruction_context()?;
@@ -1515,9 +1544,6 @@ fn execute<'a, 'b: 'a>(
     let (parameter_bytes, regions, accounts_metadata) = serialization::serialize_parameters(
         invoke_context.transaction_context,
         instruction_context,
-        invoke_context
-            .feature_set
-            .is_active(&cap_bpf_program_instruction_accounts::ID),
         !direct_mapping,
     )?;
     serialize_time.stop();
@@ -1570,17 +1596,11 @@ fn execute<'a, 'b: 'a>(
         }
         match result {
             ProgramResult::Ok(status) if status != SUCCESS => {
-                let error: InstructionError = if (status == MAX_ACCOUNTS_DATA_ALLOCATIONS_EXCEEDED
+                let error: InstructionError = if status == MAX_INSTRUCTION_TRACE_LENGTH_EXCEEDED
                     && !invoke_context
                         .feature_set
-                        .is_active(&cap_accounts_data_allocations_per_transaction::id()))
-                    || (status == MAX_INSTRUCTION_TRACE_LENGTH_EXCEEDED
-                        && !invoke_context
-                            .feature_set
-                            .is_active(&limit_max_instruction_trace_length::id()))
+                        .is_active(&limit_max_instruction_trace_length::id())
                 {
-                    // Until the cap_accounts_data_allocations_per_transaction feature is
-                    // enabled, map the `MAX_ACCOUNTS_DATA_ALLOCATIONS_EXCEEDED` error to `InvalidError`.
                     // Until the limit_max_instruction_trace_length feature is
                     // enabled, map the `MAX_INSTRUCTION_TRACE_LENGTH_EXCEEDED` error to `InvalidError`.
                     InstructionError::InvalidError
@@ -1591,13 +1611,12 @@ fn execute<'a, 'b: 'a>(
             }
             ProgramResult::Err(mut error) => {
                 if direct_mapping {
-                    if let Some(EbpfError::AccessViolation(
-                        _pc,
+                    if let EbpfError::AccessViolation(
                         AccessType::Store,
                         address,
                         _size,
                         _section_name,
-                    )) = error.downcast_ref()
+                    ) = error
                     {
                         // If direct_mapping is enabled and a program tries to write to a readonly
                         // region we'll get a memory access violation. Map it to a more specific
@@ -1605,7 +1624,7 @@ fn execute<'a, 'b: 'a>(
                         if let Some((instruction_account_index, _)) = account_region_addrs
                             .iter()
                             .enumerate()
-                            .find(|(_, vm_region)| vm_region.contains(address))
+                            .find(|(_, vm_region)| vm_region.contains(&address))
                         {
                             let transaction_context = &invoke_context.transaction_context;
                             let instruction_context =
@@ -1616,17 +1635,21 @@ fn execute<'a, 'b: 'a>(
                                 instruction_account_index as IndexOfAccount,
                             )?;
 
-                            error = Box::new(if account.is_executable() {
+                            error = EbpfError::SyscallError(Box::new(if account.is_executable() {
                                 InstructionError::ExecutableDataModified
                             } else if account.is_writable() {
                                 InstructionError::ExternalAccountDataModified
                             } else {
                                 InstructionError::ReadonlyDataModified
-                            })
+                            }));
                         }
                     }
                 }
-                Err(error)
+                Err(if let EbpfError::SyscallError(err) = error {
+                    err
+                } else {
+                    error.into()
+                })
             }
             _ => Ok(()),
         }
@@ -1699,7 +1722,7 @@ pub mod test_utils {
                     .expect("Failed to get account key");
 
                 if let Ok(loaded_program) = load_program_from_bytes(
-                    &FeatureSet::all_enabled(),
+                    true,
                     None,
                     &mut load_program_metrics,
                     account.data(),
@@ -1707,6 +1730,7 @@ pub mod test_utils {
                     account.data().len(),
                     0,
                     program_runtime_environment.clone(),
+                    false,
                 ) {
                     invoke_context
                         .programs_modified_by_tx
@@ -1729,11 +1753,7 @@ mod tests {
         solana_program_runtime::{
             invoke_context::mock_process_instruction, with_mock_invoke_context,
         },
-        solana_rbpf::{
-            elf::SBPFVersion,
-            verifier::Verifier,
-            vm::{Config, ContextObject, FunctionRegistry},
-        },
+        solana_rbpf::vm::ContextObject,
         solana_sdk::{
             account::{
                 create_account_shared_data_for_test as create_account_for_test, AccountSharedData,
@@ -1777,7 +1797,7 @@ mod tests {
             transaction_accounts,
             instruction_accounts,
             expected_result,
-            super::process_instruction,
+            Entrypoint::vm,
             |invoke_context| {
                 test_utils::load_all_invoked_programs(invoke_context);
             },
@@ -1795,21 +1815,6 @@ mod tests {
         program_account.set_data(elf);
         program_account.set_executable(true);
         program_account
-    }
-
-    #[test]
-    #[should_panic(expected = "LDDWCannotBeLast")]
-    fn test_bpf_loader_check_load_dw() {
-        let prog = &[
-            0x18, 0x00, 0x00, 0x00, 0x88, 0x77, 0x66, 0x55, // first half of lddw
-        ];
-        RequisiteVerifier::verify(
-            prog,
-            &Config::default(),
-            &SBPFVersion::V2,
-            &FunctionRegistry::default(),
-        )
-        .unwrap();
     }
 
     #[test]
@@ -2011,7 +2016,7 @@ mod tests {
             vec![(program_id, program_account.clone())],
             Vec::new(),
             Err(InstructionError::ProgramFailedToComplete),
-            super::process_instruction,
+            Entrypoint::vm,
             |invoke_context| {
                 invoke_context.mock_set_remaining(0);
                 test_utils::load_all_invoked_programs(invoke_context);
@@ -2557,7 +2562,7 @@ mod tests {
                 transaction_accounts,
                 instruction_accounts,
                 expected_result,
-                super::process_instruction,
+                Entrypoint::vm,
                 |_invoke_context| {},
                 |_invoke_context| {},
             )
@@ -4043,40 +4048,31 @@ mod tests {
         // when `enable_heap_size_round_up` not enabled:
         {
             // assert less than 32K heap should cost zero unit
-            assert_eq!(0, calculate_heap_cost(31_u64 * 1024, heap_cost, false));
+            assert_eq!(0, calculate_heap_cost(31 * 1024, heap_cost, false));
 
             // assert exact 32K heap should be cost zero unit
-            assert_eq!(0, calculate_heap_cost(32_u64 * 1024, heap_cost, false));
+            assert_eq!(0, calculate_heap_cost(32 * 1024, heap_cost, false));
 
             // assert slightly more than 32K heap is mistakenly cost zero unit
-            assert_eq!(0, calculate_heap_cost(33_u64 * 1024, heap_cost, false));
+            assert_eq!(0, calculate_heap_cost(33 * 1024, heap_cost, false));
 
             // assert exact 64K heap should cost 1 * heap_cost
-            assert_eq!(
-                heap_cost,
-                calculate_heap_cost(64_u64 * 1024, heap_cost, false)
-            );
+            assert_eq!(heap_cost, calculate_heap_cost(64 * 1024, heap_cost, false));
         }
 
         // when `enable_heap_size_round_up` is enabled:
         {
             // assert less than 32K heap should cost zero unit
-            assert_eq!(0, calculate_heap_cost(31_u64 * 1024, heap_cost, true));
+            assert_eq!(0, calculate_heap_cost(31 * 1024, heap_cost, true));
 
             // assert exact 32K heap should be cost zero unit
-            assert_eq!(0, calculate_heap_cost(32_u64 * 1024, heap_cost, true));
+            assert_eq!(0, calculate_heap_cost(32 * 1024, heap_cost, true));
 
             // assert slightly more than 32K heap should cost 1 * heap_cost
-            assert_eq!(
-                heap_cost,
-                calculate_heap_cost(33_u64 * 1024, heap_cost, true)
-            );
+            assert_eq!(heap_cost, calculate_heap_cost(33 * 1024, heap_cost, true));
 
             // assert exact 64K heap should cost 1 * heap_cost
-            assert_eq!(
-                heap_cost,
-                calculate_heap_cost(64_u64 * 1024, heap_cost, true)
-            );
+            assert_eq!(heap_cost, calculate_heap_cost(64 * 1024, heap_cost, true));
         }
     }
 
@@ -4104,7 +4100,7 @@ mod tests {
         let transaction_accounts = vec![];
         with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
         let program_id = Pubkey::new_unique();
-        let env = Arc::new(BuiltinProgram::new_loader(Config::default()));
+        let env = Arc::new(BuiltinProgram::new_mock());
         let program = LoadedProgram {
             program: LoadedProgramType::Unloaded(env),
             account_size: 0,
@@ -4144,7 +4140,7 @@ mod tests {
         let transaction_accounts = vec![];
         with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
         let program_id = Pubkey::new_unique();
-        let env = Arc::new(BuiltinProgram::new_loader(Config::default()));
+        let env = Arc::new(BuiltinProgram::new_mock());
         let program = LoadedProgram {
             program: LoadedProgramType::Unloaded(env),
             account_size: 0,

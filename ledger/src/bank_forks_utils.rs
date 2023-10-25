@@ -189,6 +189,15 @@ pub fn load_bank_forks(
             (bank_forks, None)
         };
 
+    bank_forks
+        .read()
+        .expect("Failed to read lock the bank forks")
+        .root_bank()
+        .loaded_programs_cache
+        .write()
+        .expect("Failed to write lock the program cache")
+        .set_fork_graph(bank_forks.clone());
+
     let mut leader_schedule_cache =
         LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().root_bank());
     if process_options.full_leader_cache {
@@ -264,6 +273,7 @@ fn bank_forks_from_snapshot(
             process_options.shrink_ratio,
             process_options.accounts_db_test_hash_calculation,
             process_options.accounts_db_skip_shrink,
+            process_options.accounts_db_force_initial_clean,
             process_options.verify_index,
             process_options.accounts_db_config.clone(),
             accounts_update_notifier,

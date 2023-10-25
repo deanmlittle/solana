@@ -11,6 +11,7 @@ use {
             StoredAccountMeta, StoredMeta, StoredMetaWriteVersion,
         },
         accounts_file::{AccountsFileError, Result, ALIGN_BOUNDARY_OFFSET},
+        accounts_hash::AccountHash,
         storable_accounts::StorableAccounts,
         u64_align,
     },
@@ -19,7 +20,6 @@ use {
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
         clock::Slot,
-        hash::Hash,
         pubkey::Pubkey,
         stake_history::Epoch,
     },
@@ -114,7 +114,7 @@ pub struct AppendVecStoredAccountMeta<'append_vec> {
     pub(crate) data: &'append_vec [u8],
     pub(crate) offset: usize,
     pub(crate) stored_size: usize,
-    pub(crate) hash: &'append_vec Hash,
+    pub(crate) hash: &'append_vec AccountHash,
 }
 
 impl<'append_vec> AppendVecStoredAccountMeta<'append_vec> {
@@ -122,7 +122,7 @@ impl<'append_vec> AppendVecStoredAccountMeta<'append_vec> {
         &self.meta.pubkey
     }
 
-    pub fn hash(&self) -> &'append_vec Hash {
+    pub fn hash(&self) -> &'append_vec AccountHash {
         self.hash
     }
 
@@ -487,7 +487,7 @@ impl AppendVec {
     pub fn get_account(&self, offset: usize) -> Option<(StoredAccountMeta, usize)> {
         let (meta, next): (&StoredMeta, _) = self.get_type(offset)?;
         let (account_meta, next): (&AccountMeta, _) = self.get_type(next)?;
-        let (hash, next): (&Hash, _) = self.get_type(next)?;
+        let (hash, next): (&AccountHash, _) = self.get_type(next)?;
         let (data, next) = self.get_slice(next, meta.data_len as usize)?;
         let stored_size = next - offset;
         Some((
@@ -519,7 +519,7 @@ impl AppendVec {
     pub fn account_matches_owners(
         &self,
         offset: usize,
-        owners: &[&Pubkey],
+        owners: &[Pubkey],
     ) -> std::result::Result<usize, MatchAccountOwnerError> {
         let account_meta = self
             .get_account_meta(offset)
@@ -529,7 +529,7 @@ impl AppendVec {
         } else {
             owners
                 .iter()
-                .position(|entry| &&account_meta.owner == entry)
+                .position(|entry| &account_meta.owner == entry)
                 .ok_or(MatchAccountOwnerError::NoMatch)
         }
     }
@@ -575,7 +575,7 @@ impl AppendVec {
         'b,
         T: ReadableAccount + Sync,
         U: StorableAccounts<'a, T>,
-        V: Borrow<Hash>,
+        V: Borrow<AccountHash>,
     >(
         &self,
         accounts: &StorableAccountsWithHashesAndWriteVersions<'a, 'b, T, U, V>,
@@ -611,11 +611,11 @@ impl AppendVec {
                 .map(|account| account.data())
                 .unwrap_or_default()
                 .as_ptr();
-            let hash_ptr = hash.as_ref().as_ptr();
+            let hash_ptr = bytemuck::bytes_of(hash).as_ptr();
             let ptrs = [
                 (meta_ptr as *const u8, mem::size_of::<StoredMeta>()),
                 (account_meta_ptr as *const u8, mem::size_of::<AccountMeta>()),
-                (hash_ptr, mem::size_of::<Hash>()),
+                (hash_ptr, mem::size_of::<AccountHash>()),
                 (data_ptr, data_len),
             ];
             if let Some(res) = self.append_ptrs_locked(&mut offset, &ptrs) {
@@ -654,6 +654,7 @@ pub mod tests {
         rand::{thread_rng, Rng},
         solana_sdk::{
             account::{accounts_equal, Account, AccountSharedData, WritableAccount},
+            hash::Hash,
             timing::duration_as_ms,
         },
         std::{mem::ManuallyDrop, time::Instant},
@@ -669,7 +670,7 @@ pub mod tests {
             let accounts = [(&data.0.pubkey, &data.1)];
             let slice = &accounts[..];
             let account_data = (slot_ignored, slice);
-            let hash = Hash::default();
+            let hash = AccountHash(Hash::default());
             let storable_accounts =
                 StorableAccountsWithHashesAndWriteVersions::new_with_hashes_and_write_versions(
                     &account_data,
@@ -686,6 +687,8 @@ pub mod tests {
         pub(crate) fn ref_executable_byte(&self) -> &u8 {
             match self {
                 Self::AppendVec(av) => av.ref_executable_byte(),
+                // Tests currently only cover AppendVec.
+                Self::Hot(_) => unreachable!(),
             }
         }
     }
@@ -738,7 +741,7 @@ pub mod tests {
         // for (Slot, &'a [(&'a Pubkey, &'a T)], IncludeSlotInHash)
         let slot = 0 as Slot;
         let pubkey = Pubkey::default();
-        StorableAccountsWithHashesAndWriteVersions::<'_, '_, _, _, &Hash>::new(&(
+        StorableAccountsWithHashesAndWriteVersions::<'_, '_, _, _, &AccountHash>::new(&(
             slot,
             &[(&pubkey, &account)][..],
             INCLUDE_SLOT_IN_HASH_TESTS,
@@ -753,7 +756,7 @@ pub mod tests {
         // mismatch between lens of accounts, hashes, write_versions
         let mut hashes = Vec::default();
         if correct_hashes {
-            hashes.push(Hash::default());
+            hashes.push(AccountHash(Hash::default()));
         }
         let mut write_versions = Vec::default();
         if correct_write_versions {
@@ -796,7 +799,7 @@ pub mod tests {
         let account = AccountSharedData::default();
         let slot = 0 as Slot;
         let pubkeys = [Pubkey::default()];
-        let hashes = Vec::<Hash>::default();
+        let hashes = Vec::<AccountHash>::default();
         let write_versions = Vec::default();
         let mut accounts = vec![(&pubkeys[0], &account)];
         accounts.clear();
@@ -817,7 +820,10 @@ pub mod tests {
         let account = AccountSharedData::default();
         let slot = 0 as Slot;
         let pubkeys = [Pubkey::from([5; 32]), Pubkey::from([6; 32])];
-        let hashes = vec![Hash::new(&[3; 32]), Hash::new(&[4; 32])];
+        let hashes = vec![
+            AccountHash(Hash::new(&[3; 32])),
+            AccountHash(Hash::new(&[4; 32])),
+        ];
         let write_versions = vec![42, 43];
         let accounts = [(&pubkeys[0], &account), (&pubkeys[1], &account)];
         let accounts2 = (slot, &accounts[..], INCLUDE_SLOT_IN_HASH_TESTS);
@@ -848,7 +854,7 @@ pub mod tests {
         // for (Slot, &'a [(&'a Pubkey, &'a T)], IncludeSlotInHash)
         let slot = 0 as Slot;
         let pubkey = Pubkey::default();
-        let hashes = vec![Hash::default()];
+        let hashes = vec![AccountHash(Hash::default())];
         let write_versions = vec![0];
         let accounts = [(&pubkey, &account)];
         let accounts2 = (slot, &accounts[..], INCLUDE_SLOT_IN_HASH_TESTS);
@@ -1022,37 +1028,36 @@ pub mod tests {
         let path = get_append_vec_path("test_append_data");
         let av = AppendVec::new(&path.path, true, 1024 * 1024);
         let owners: Vec<Pubkey> = (0..2).map(|_| Pubkey::new_unique()).collect();
-        let owners_refs: Vec<&Pubkey> = owners.iter().collect();
 
         let mut account = create_test_account(5);
         account.1.set_owner(owners[0]);
         let index = av.append_account_test(&account).unwrap();
-        assert_eq!(av.account_matches_owners(index, &owners_refs), Ok(0));
+        assert_eq!(av.account_matches_owners(index, &owners), Ok(0));
 
         let mut account1 = create_test_account(6);
         account1.1.set_owner(owners[1]);
         let index1 = av.append_account_test(&account1).unwrap();
-        assert_eq!(av.account_matches_owners(index1, &owners_refs), Ok(1));
-        assert_eq!(av.account_matches_owners(index, &owners_refs), Ok(0));
+        assert_eq!(av.account_matches_owners(index1, &owners), Ok(1));
+        assert_eq!(av.account_matches_owners(index, &owners), Ok(0));
 
         let mut account2 = create_test_account(6);
         account2.1.set_owner(Pubkey::new_unique());
         let index2 = av.append_account_test(&account2).unwrap();
         assert_eq!(
-            av.account_matches_owners(index2, &owners_refs),
+            av.account_matches_owners(index2, &owners),
             Err(MatchAccountOwnerError::NoMatch)
         );
 
         // tests for overflow
         assert_eq!(
-            av.account_matches_owners(usize::MAX - mem::size_of::<StoredMeta>(), &owners_refs),
+            av.account_matches_owners(usize::MAX - mem::size_of::<StoredMeta>(), &owners),
             Err(MatchAccountOwnerError::UnableToLoad)
         );
 
         assert_eq!(
             av.account_matches_owners(
                 usize::MAX - mem::size_of::<StoredMeta>() - mem::size_of::<AccountMeta>() + 1,
-                &owners_refs
+                &owners
             ),
             Err(MatchAccountOwnerError::UnableToLoad)
         );
@@ -1182,7 +1187,9 @@ pub mod tests {
             av.append_account_test(&create_test_account(10)).unwrap();
 
             let accounts = av.accounts(0);
-            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap();
+            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap() else {
+                panic!("StoredAccountMeta can only be AppendVec in this test.");
+            };
             account.set_data_len_unsafe(crafted_data_len);
             assert_eq!(account.data_len(), crafted_data_len);
 
@@ -1210,7 +1217,9 @@ pub mod tests {
             av.append_account_test(&create_test_account(10)).unwrap();
 
             let accounts = av.accounts(0);
-            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap();
+            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap() else {
+                panic!("StoredAccountMeta can only be AppendVec in this test.");
+            };
             account.set_data_len_unsafe(too_large_data_len);
             assert_eq!(account.data_len(), too_large_data_len);
 
@@ -1246,14 +1255,18 @@ pub mod tests {
             assert_eq!(*accounts[0].ref_executable_byte(), 0);
             assert_eq!(*accounts[1].ref_executable_byte(), 1);
 
-            let StoredAccountMeta::AppendVec(account) = &accounts[0];
+            let StoredAccountMeta::AppendVec(account) = &accounts[0] else {
+                panic!("StoredAccountMeta can only be AppendVec in this test.");
+            };
             let crafted_executable = u8::max_value() - 1;
 
             account.set_executable_as_byte(crafted_executable);
 
             // reload crafted accounts
             let accounts = av.accounts(0);
-            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap();
+            let StoredAccountMeta::AppendVec(account) = accounts.first().unwrap() else {
+                panic!("StoredAccountMeta can only be AppendVec in this test.");
+            };
 
             // upper 7-bits are not 0, so sanitization should fail
             assert!(!account.sanitize_executable());

@@ -138,14 +138,12 @@ mod tests {
             get_tmp_ledger_path_auto_delete, leader_schedule_cache::LeaderScheduleCache,
         },
         solana_poh::poh_recorder::{PohRecorder, WorkingBankEntry},
-        solana_runtime::{
-            bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
-            vote_sender_types::ReplayVoteReceiver,
-        },
+        solana_runtime::{bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache},
         solana_sdk::{
             genesis_config::GenesisConfig, poh_config::PohConfig, pubkey::Pubkey,
             signature::Keypair, system_transaction,
         },
+        solana_vote::vote_sender_types::ReplayVoteReceiver,
         std::{
             sync::{atomic::AtomicBool, RwLock},
             thread::JoinHandle,
@@ -285,7 +283,10 @@ mod tests {
             ..
         } = &test_frame;
         let worker_thread = std::thread::spawn(move || worker.run());
-        poh_recorder.write().unwrap().set_bank(bank.clone(), false);
+        poh_recorder
+            .write()
+            .unwrap()
+            .set_bank_for_test(bank.clone());
 
         let pubkey1 = Pubkey::new_unique();
 
@@ -327,7 +328,10 @@ mod tests {
             ..
         } = &test_frame;
         let worker_thread = std::thread::spawn(move || worker.run());
-        poh_recorder.write().unwrap().set_bank(bank.clone(), false);
+        poh_recorder
+            .write()
+            .unwrap()
+            .set_bank_for_test(bank.clone());
 
         let pubkey1 = Pubkey::new_unique();
         let pubkey2 = Pubkey::new_unique();
@@ -372,7 +376,10 @@ mod tests {
             ..
         } = &test_frame;
         let worker_thread = std::thread::spawn(move || worker.run());
-        poh_recorder.write().unwrap().set_bank(bank.clone(), false);
+        poh_recorder
+            .write()
+            .unwrap()
+            .set_bank_for_test(bank.clone());
 
         let pubkey1 = Pubkey::new_unique();
         let pubkey2 = Pubkey::new_unique();
