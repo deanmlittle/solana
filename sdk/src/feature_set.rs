@@ -682,7 +682,7 @@ pub mod enable_poseidon_syscall {
 
 pub mod secp256r1_program_enabled {
     solana_sdk::declare_id!("GkVUbiefEqFzzLcArWgNG7r3BCs551UUjdH2hVE5ns3E");
-
+}
 pub mod timely_vote_credits {
     solana_sdk::declare_id!("2oXpeh141pPZCTCFHBsvCwG2BtaHZZAtrVhwaxSy6brS");
 }
